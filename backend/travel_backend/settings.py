@@ -175,7 +175,7 @@ EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
 
 # API Keys
 OPENWEATHER_API_KEY = config('OPENWEATHER_API_KEY', default='')
-GOOGLE_MAPS_API_KEY = config('GOOGLE_MAPS_API_KEY', default='')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', default='AIzaSyCECK04uie5FqmbYoA8ttNRjfnN2yjhtik')
 NOMINATIM_USER_AGENT = config('NOMINATIM_USER_AGENT', default='travel_chatbot_app')
 
 # ML Model Settings

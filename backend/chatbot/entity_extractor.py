@@ -1,169 +1,85 @@
+# chatbot/entity_extractor.py - SIMPLIFIED VERSION
+# This is now mostly a fallback - NLP engine handles primary extraction
+
 import re
-import spacy
+import logging
 from datetime import datetime, timedelta
 from dateutil import parser as date_parser
-import logging
 
 logger = logging.getLogger(__name__)
 
 
 class EntityExtractor:
     """
-    Extract entities from user messages (dates, locations, budget, etc.)
+    SIMPLIFIED: Basic entity extraction as fallback
+    Primary extraction now handled by HybridNLPEngine
     """
     
     def __init__(self):
-        try:
-            self.nlp = spacy.load("en_core_web_sm")
-        except:
-            logger.warning("spaCy model not loaded. Run: python -m spacy download en_core_web_sm")
-            self.nlp = None
+        logger.info("EntityExtractor initialized (fallback mode)")
     
     def extract_entities(self, text):
         """
-        Extract all entities from text
+        Basic entity extraction - used as fallback when NLP engine unavailable
         """
-        entities = {
-            'dates': self.extract_dates(text),
-            'locations': self.extract_locations(text),
-            'budget': self.extract_budget(text),
-            'duration': self.extract_duration(text),
-            'person_count': self.extract_person_count(text),
-            'companion_type': self.extract_companion_type(text),
-            'activities': self.extract_activities(text),
-        }
+        entities = {}
+        
+        # Extract budget
+        budget = self.extract_budget(text)
+        if budget:
+            entities['budget'] = budget
+        
+        # Extract duration
+        duration = self.extract_duration(text)
+        if duration:
+            entities['duration'] = duration
+        
+        # Extract person count
+        person_count = self.extract_person_count(text)
+        if person_count:
+            entities['person_count'] = person_count
+        
+        # Extract activities (basic)
+        activities = self.extract_activities(text)
+        if activities:
+            entities['activities'] = activities
+        
+        # Extract locations (basic)
+        locations = self.extract_locations(text)
+        if locations:
+            entities['locations'] = locations
         
         return {k: v for k, v in entities.items() if v}
     
-    # Add this to EntityExtractor class in entity_extractor.py
     def extract(self, text):
-        """Alias for extract_entities for compatibility"""
+        """Alias for compatibility"""
         return self.extract_entities(text)
-
-
-    def extract_dates(self, text):
-        """
-        Extract dates from text
-        """
-        dates = []
-        
-        # Pattern 1: DD/MM/YYYY, DD-MM-YYYY
-        date_pattern1 = r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b'
-        matches = re.finditer(date_pattern1, text)
-        for match in matches:
-            try:
-                date_str = match.group(0)
-                parsed_date = date_parser.parse(date_str, dayfirst=True)
-                dates.append(parsed_date.strftime('%Y-%m-%d'))
-            except:
-                pass
-        
-        # Pattern 2: Month names
-        months = {
-            'january': 1, 'february': 2, 'march': 3, 'april': 4,
-            'may': 5, 'june': 6, 'july': 7, 'august': 8,
-            'september': 9, 'october': 10, 'november': 11, 'december': 12,
-            'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'jun': 6,
-            'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
-        }
-        
-        for month_name, month_num in months.items():
-            if month_name in text.lower():
-                current_year = datetime.now().year
-                dates.append(f"{current_year}-{month_num:02d}-01")
-        
-        # Pattern 3: Relative dates
-        relative_patterns = {
-            r'\b(next|this) week\b': 7,
-            r'\b(next|this) month\b': 30,
-            r'\btomorrow\b': 1,
-            r'\bin (\d+) days?\b': None,
-        }
-        
-        for pattern, days_offset in relative_patterns.items():
-            match = re.search(pattern, text.lower())
-            if match:
-                if days_offset is None:
-                    # Extract number from "in X days"
-                    days_offset = int(re.search(r'(\d+)', match.group(0)).group(1))
-                
-                future_date = datetime.now() + timedelta(days=days_offset)
-                dates.append(future_date.strftime('%Y-%m-%d'))
-        
-        return dates if dates else None
-    
-    def extract_locations(self, text):
-        """
-        Extract location/destination names
-        """
-        locations = []
-        
-        # Use spaCy NER if available
-        if self.nlp:
-            doc = self.nlp(text)
-            for ent in doc.ents:
-                if ent.label_ in ['GPE', 'LOC']:  # Geo-political entity or location
-                    locations.append(ent.text)
-        
-        # Common Indian destinations (hardcoded for better accuracy)
-        common_destinations = [
-            'goa', 'manali', 'shimla', 'kerala', 'rajasthan', 'jaipur',
-            'udaipur', 'ladakh', 'kashmir', 'delhi', 'mumbai', 'bangalore',
-            'chennai', 'kolkata', 'agra', 'varanasi', 'rishikesh', 'darjeeling',
-            'ooty', 'coorg', 'andaman', 'lakshadweep', 'hampi', 'mysore'
-        ]
-        
-        text_lower = text.lower()
-        for dest in common_destinations:
-            if dest in text_lower:
-                locations.append(dest.title())
-        
-        return list(set(locations)) if locations else None
     
     def extract_budget(self, text):
-        """
-        Extract budget information
-        """
+        """Extract budget information"""
         budget_info = {}
         
-        # Pattern: "budget of 50000", "50k budget", "around 30000"
         amount_patterns = [
-            r'\b(\d+)k\b',  # 50k format
-            r'\b(\d{4,})\b',  # Direct numbers
-            r'\b(\d+)\s*(thousand|lakh|lakhs)\b'
+            (r'(\d+)k\b', lambda m: int(m.group(1)) * 1000),
+            (r'(\d{4,})', lambda m: int(m.group(1))),
+            (r'(\d+)\s*(lakh|lakhs)', lambda m: int(m.group(1)) * 100000),
         ]
         
-        for pattern in amount_patterns:
+        for pattern, converter in amount_patterns:
             match = re.search(pattern, text.lower())
             if match:
-                amount = match.group(1)
-                if 'k' in pattern:
-                    amount = int(amount) * 1000
-                elif 'lakh' in match.group(0):
-                    amount = int(amount) * 100000
-                elif 'thousand' in match.group(0):
-                    amount = int(amount) * 1000
-                else:
-                    amount = int(amount)
-                
+                amount = converter(match)
                 budget_info['amount'] = amount
-                
-                # Check for per person or total
-                if 'per person' in text.lower():
-                    budget_info['per_person'] = True
-                else:
-                    budget_info['per_person'] = False
-                
+                budget_info['per_person'] = 'per person' in text.lower()
                 return budget_info
         
-        # Budget range keywords
+        # Budget keywords
         budget_keywords = {
-            'cheap': {'min': 0, 'max': 2000, 'category': 'Budget'},
-            'budget': {'min': 0, 'max': 2000, 'category': 'Budget'},
-            'affordable': {'min': 2000, 'max': 5000, 'category': 'Mid-Range'},
-            'moderate': {'min': 2000, 'max': 5000, 'category': 'Mid-Range'},
-            'expensive': {'min': 10000, 'max': 25000, 'category': 'Luxury'},
-            'luxury': {'min': 10000, 'max': 50000, 'category': 'Luxury'},
+            'cheap': {'min': 0, 'max': 20000, 'category': 'Budget'},
+            'budget': {'min': 0, 'max': 25000, 'category': 'Budget'},
+            'affordable': {'min': 20000, 'max': 50000, 'category': 'Mid-Range'},
+            'expensive': {'min': 50000, 'max': 100000, 'category': 'Premium'},
+            'luxury': {'min': 100000, 'max': 250000, 'category': 'Luxury'},
         }
         
         text_lower = text.lower()
@@ -174,15 +90,12 @@ class EntityExtractor:
         return None
     
     def extract_duration(self, text):
-        """
-        Extract trip duration
-        """
-        # Pattern: "for 5 days", "3 day trip", "week long"
+        """Extract trip duration"""
         duration_patterns = [
-            (r'(\d+)\s*(day|days)', 'days'),
-            (r'(\d+)\s*(night|nights)', 'nights'),
-            (r'(\d+)\s*(week|weeks)', 'weeks'),
-            (r'(weekend|long weekend)', 'weekend'),
+            (r'(\d+)\s*days?', 'days'),
+            (r'(\d+)\s*nights?', 'nights'),
+            (r'(\d+)\s*weeks?', 'weeks'),
+            (r'weekend|long weekend', 'weekend'),
         ]
         
         for pattern, unit in duration_patterns:
@@ -199,179 +112,144 @@ class EntityExtractor:
                     value = value + 1
                     unit = 'days'
                 
-                return {'value': value, 'unit': 'days'}
+                return {'value': value, 'unit': 'days', 'days': value}
         
         return None
     
     def extract_person_count(self, text):
-        """
-        Extract number of people traveling
-        """
-        # Pattern: "4 people", "group of 6", "5 of us"
+        """Extract number of people"""
         count_patterns = [
-            r'(\d+)\s*(people|persons|travelers)',
+            r'(\d+)\s*(people|persons|travelers|pax)',
             r'group of (\d+)',
             r'(\d+) of us',
-            r'(\d+)\s*adults?',
         ]
         
         for pattern in count_patterns:
             match = re.search(pattern, text.lower())
             if match:
-                count = int(match.group(1))
-                return count
+                return int(match.group(1))
         
-        return None
-    
-    def extract_companion_type(self, text):
-        """
-        Extract companion type (family, friends, solo, etc.)
-        """
-        companion_patterns = {
-            'solo': r'\b(solo|alone|myself|by myself)\b',
-            'couple': r'\b(couple|partner|spouse|wife|husband|girlfriend|boyfriend)\b',
-            'family': r'\b(family|parents|kids|children)\b',
-            'friends': r'\b(friends|buddies|colleagues)\b',
-            'group': r'\b(group|team)\b',
-        }
-        
-        text_lower = text.lower()
-        for companion_type, pattern in companion_patterns.items():
-            if re.search(pattern, text_lower):
-                return companion_type
+        # Special cases
+        if 'solo' in text.lower() or 'alone' in text.lower():
+            return 1
+        elif 'couple' in text.lower():
+            return 2
+        elif 'family' in text.lower():
+            return 4
         
         return None
     
     def extract_activities(self, text):
-        """
-        Extract activity/interest keywords
-        """
+        """Extract activity keywords"""
         activity_keywords = {
-            'adventure': ['adventure', 'trekking', 'hiking', 'rafting', 'paragliding', 'skiing'],
-            'beach': ['beach', 'sea', 'ocean', 'swimming', 'surfing'],
-            'cultural': ['culture', 'heritage', 'temple', 'museum', 'historical'],
-            'food': ['food', 'cuisine', 'restaurant', 'culinary'],
-            'shopping': ['shopping', 'market', 'bazaar'],
-            'wildlife': ['wildlife', 'safari', 'animals', 'nature'],
-            'photography': ['photography', 'photos', 'pictures'],
-            'relaxation': ['relax', 'spa', 'wellness', 'peaceful', 'quiet'],
+            'adventure': ['adventure', 'trekking', 'hiking', 'rafting'],
+            'beach': ['beach', 'sea', 'ocean', 'coastal'],
+            'cultural': ['cultural', 'heritage', 'temple', 'historical'],
+            'wildlife': ['wildlife', 'safari', 'animals', 'jungle'],
+            'spiritual': ['spiritual', 'pilgrimage', 'religious'],
+            'relaxation': ['relax', 'peaceful', 'spa', 'wellness'],
+            'food': ['food', 'cuisine', 'culinary'],
         }
         
-        detected_activities = []
+        detected = []
         text_lower = text.lower()
         
         for activity, keywords in activity_keywords.items():
-            if any(keyword in text_lower for keyword in keywords):
-                detected_activities.append(activity)
+            if any(kw in text_lower for kw in keywords):
+                detected.append(activity)
         
-        return detected_activities if detected_activities else None
+        return detected if detected else None
+    
+    def extract_locations(self, text):
+        """Extract location names (basic)"""
+        common_destinations = [
+            'goa', 'manali', 'shimla', 'kerala', 'jaipur', 'udaipur',
+            'ladakh', 'kashmir', 'delhi', 'mumbai', 'rishikesh',
+            'varanasi', 'darjeeling', 'ooty', 'coorg', 'hampi'
+        ]
+        
+        found = []
+        text_lower = text.lower()
+        
+        for dest in common_destinations:
+            if dest in text_lower:
+                found.append(dest.title())
+        
+        return found if found else None
+    
+    def extract_weather_preference(self, text):
+        """Extract weather preferences"""
+        weather_patterns = {
+            'cold': r'\b(cold|cool|chilly)\b',
+            'hot': r'\b(hot|warm|sunny)\b',
+            'pleasant': r'\b(pleasant|moderate|comfortable)\b',
+        }
+        
+        text_lower = text.lower()
+        for preference, pattern in weather_patterns.items():
+            if re.search(pattern, text_lower):
+                return preference
+        
+        return None
+    
+    def extract_time_frame(self, text):
+        """Extract time frames"""
+        time_patterns = {
+            r'next\s+(\d+)\s+days?': lambda m: {'start': 0, 'end': int(m.group(1)), 'unit': 'days'},
+            r'this\s+weekend': lambda m: {'start': 0, 'end': 3, 'unit': 'days', 'type': 'weekend'},
+            r'next\s+week': lambda m: {'start': 7, 'end': 14, 'unit': 'days'},
+        }
+        
+        text_lower = text.lower()
+        for pattern, extractor in time_patterns.items():
+            match = re.search(pattern, text_lower)
+            if match:
+                return extractor(match)
+        
+        return None
+    
+    def extract_climate_preference(self, text):
+        """Extract climate preferences"""
+        climate_keywords = {
+            'tropical': ['tropical', 'humid', 'coastal'],
+            'alpine': ['alpine', 'mountain', 'hills', 'snow'],
+            'arid': ['desert', 'dry'],
+            'temperate': ['temperate', 'moderate'],
+        }
+        
+        detected = []
+        text_lower = text.lower()
+        
+        for climate, keywords in climate_keywords.items():
+            if any(kw in text_lower for kw in keywords):
+                detected.append(climate)
+        
+        return detected if detected else None
 
 
+# Keep for backward compatibility
 class ContextManager:
     """
-    Manage conversation context and extracted information
+    DEPRECATED: Use ConversationContextManager instead
+    Kept for backward compatibility only
     """
     
     def __init__(self, session):
         self.session = session
         self.extractor = EntityExtractor()
+        logger.warning("ContextManager is deprecated. Use ConversationContextManager instead.")
     
     def update_context(self, message_text, detected_intent):
-        """
-        Update session context with new information
-        """
-        # Extract entities from message
-        entities = self.extractor.extract_entities(message_text)
-        
-        # Get or create conversation state
-        from chatbot.models import ConversationState
-        state, created = ConversationState.objects.get_or_create(session=self.session)
-        
-        # Update extracted information
-        if entities.get('dates'):
-            dates = entities['dates']
-            if len(dates) >= 2:
-                state.travel_dates = {
-                    'start_date': dates[0],
-                    'end_date': dates[1]
-                }
-            elif len(dates) == 1:
-                state.travel_dates = {'start_date': dates[0]}
-        
-        if entities.get('budget'):
-            state.budget = entities['budget']
-        
-        if entities.get('companion_type') or entities.get('person_count'):
-            state.companions = {
-                'type': entities.get('companion_type'),
-                'count': entities.get('person_count')
-            }
-        
-        if entities.get('duration'):
-            if not state.travel_dates.get('end_date') and state.travel_dates.get('start_date'):
-                # Calculate end date from duration
-                from datetime import datetime, timedelta
-                start_date = datetime.strptime(state.travel_dates['start_date'], '%Y-%m-%d')
-                duration_days = entities['duration']['value']
-                end_date = start_date + timedelta(days=duration_days)
-                state.travel_dates['end_date'] = end_date.strftime('%Y-%m-%d')
-        
-        if entities.get('activities'):
-            state.interests = list(set(state.interests + entities['activities']))
-        
-        if entities.get('locations'):
-    # Use state.extracted_info instead of self.session.extracted_info
-            extracted_info = state.extracted_info if isinstance(state.extracted_info, dict) else {}
-            if 'preferred_destinations' not in extracted_info:
-                extracted_info['preferred_destinations'] = []
-            extracted_info['preferred_destinations'].extend(entities['locations'])
-            state.extracted_info = extracted_info
-        
-        # Update current flow based on intent
-        flow_mapping = {
-            'greeting': 'onboarding',
-            'destination_query': 'searching',
-            'itinerary_request': 'planning',
-            'booking_help': 'booking',
-            'feedback_submit': 'feedback',
-        }
-        
-        if detected_intent in flow_mapping:
-            state.current_flow = flow_mapping[detected_intent]
-        
-        state.save()
-        
-        return state
+        """Deprecated - context updates now handled by ConversationContextManager"""
+        logger.warning("update_context is deprecated")
+        pass
     
     def get_missing_information(self):
-        """
-        Determine what information is still needed
-        """
-        from chatbot.models import ConversationState
-        try:
-            state = ConversationState.objects.get(session=self.session)
-        except ConversationState.DoesNotExist:
-            return ['travel_dates', 'budget', 'companions', 'interests']
-        
-        missing = []
-        
-        if not state.travel_dates or not state.travel_dates.get('start_date'):
-            missing.append('travel_dates')
-        
-        if not state.budget:
-            missing.append('budget')
-        
-        if not state.companions:
-            missing.append('companions')
-        
-        if not state.interests:
-            missing.append('interests')
-        
-        return missing
+        """Deprecated"""
+        logger.warning("get_missing_information is deprecated")
+        return []
     
     def is_information_complete(self):
-        """
-        Check if we have all required information
-        """
-        missing = self.get_missing_information()
-        return len(missing) == 0
+        """Deprecated"""
+        logger.warning("is_information_complete is deprecated")
+        return False
