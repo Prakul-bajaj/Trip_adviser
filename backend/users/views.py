@@ -3,7 +3,8 @@ from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework import generics, status, views
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, AllowAny
-from django.contrib.auth import update_session_auth_hash
+from django.contrib.auth import update_session_auth_hash, authenticate
+from asgiref.sync import sync_to_async
 from .models import User, UserProfile, TravelPreferences
 from .serializers import (
     UserRegistrationSerializer, 
@@ -18,6 +19,8 @@ from .serializers import (
 from .authentication import generate_mfa_secret, generate_qr_code, verify_mfa_code, get_tokens_for_user
 from .permissions import IsOwnerOrAdmin
 from rest_framework.decorators import api_view, permission_classes
+from django.views.decorators.csrf import csrf_exempt
+from django.utils.decorators import method_decorator
 
 
 class UserRegistrationView(generics.CreateAPIView):
@@ -26,7 +29,7 @@ class UserRegistrationView(generics.CreateAPIView):
     permission_classes = [AllowAny]
     serializer_class = UserRegistrationSerializer
     
-    def create(self, request, *args, **kwargs):  # ← Make sure this is NOT async
+    def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
@@ -40,22 +43,48 @@ class UserRegistrationView(generics.CreateAPIView):
         }, status=status.HTTP_201_CREATED)
 
 
+@method_decorator(csrf_exempt, name='dispatch')
 class UserLoginView(views.APIView):
-    """User login endpoint"""
+    """User login endpoint - Class-based view with proper sync handling"""
     permission_classes = [AllowAny]
     
-    def post(self, request):  # ← Make sure this is NOT async
-        serializer = UserLoginSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+    def post(self, request):
+        """Synchronous login handler"""
+        email = request.data.get('email')
+        password = request.data.get('password')
         
-        user = serializer.validated_data['user']
-        tokens = get_tokens_for_user(user)
+        if not email or not password:
+            return Response(
+                {'error': 'Email and password are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         
-        return Response({
-            'user': UserSerializer(user).data,
-            'tokens': tokens,
-            'message': 'Login successful'
-        }, status=status.HTTP_200_OK)
+        # Authenticate user
+        user = authenticate(request, email=email, password=password)
+        
+        if user is not None:
+            # Generate tokens
+            refresh = RefreshToken.for_user(user)
+            
+            return Response({
+                'tokens': {
+                    'access': str(refresh.access_token),
+                    'refresh': str(refresh)
+                },
+                'user': {
+                    'id': str(user.id),
+                    'email': user.email,
+                    'name': user.get_full_name(),
+                    'first_name': user.first_name,
+                    'last_name': user.last_name,
+                },
+                'message': 'Login successful'
+            }, status=status.HTTP_200_OK)
+        else:
+            return Response(
+                {'error': 'Invalid credentials'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
 
 
 class UserProfileView(generics.RetrieveUpdateAPIView):

@@ -26,8 +26,16 @@ class IntentClassifier:
         Define regex patterns for common intents
         """
         return {
+            # NEW: Reference intent - MUST BE CHECKED FIRST
+            'reference': [
+                r'\b(the )?(first|second|third|last|top)\s+(one|place|destination|option)\b',
+                r'\b(tell me|more about|info about|details about|show me)\s+(the )?(first|second|third|last|it|that|this)\b',
+                r'\b(it|that|this|these|those)\b(?!.*\b(place|destination|is|are|will|should)\b)',
+                r'\b(which of (these|those|them))\b',
+                r'\b(any of (these|those|them))\b',
+            ],
             'greeting': [
-                r'\b(hi|hello|hey|greetings|good morning|good evening)\b',
+                r'^\s*(hi|hello|hey|greetings|good morning|good evening)\b',  # Must be at start
                 r'\bhow are you\b',
                 r'\bwhat\'?s up\b'
             ],
@@ -39,7 +47,14 @@ class IntentClassifier:
             'budget_query': [
                 r'\b(how much|cost|price|budget|expensive|cheap|affordable)\b',
                 r'\b(spend|spending)\b',
-                r'\bmoney\b'
+                r'\bmoney\b',
+                r'\bunder\s+(\d+)k?\b',  # "under 30k"
+                r'\bwithin\s+(\d+)k?\b'  # "within budget"
+            ],
+            'duration_query': [
+                r'\b(\d+)\s*days?\b',
+                r'\bfor\s+(\d+)\s+days?\b',
+                r'\b(weekend|week)\b'
             ],
             'weather_query': [
                 r'\b(weather|temperature|climate|rain|snow|sunny|cold|hot)\b',
@@ -65,6 +80,11 @@ class IntentClassifier:
                 r'\b(book|booking|reserve|reservation)\b',
                 r'\b(hotel|flight|train|ticket)\b'
             ],
+            'more_info': [
+                r'\b(tell me more|more info|details|elaborate)\b',
+                r'\bwhat about\b',
+                r'\bhow about\b'
+            ],
             'feedback_submit': [
                 r'\b(feedback|review|rating|complain|complaint|suggest|suggestion)\b',
                 r'\b(good|bad|excellent|poor|love|hate)\b\s+(experience|service|recommendation)'
@@ -78,13 +98,25 @@ class IntentClassifier:
             ]
         }
     
-    def classify_intent(self, text):
+    def classify_intent(self, text, has_context=False):
         """
         Classify intent using hybrid approach
+        has_context: True if there are previous results in context
         """
         text_lower = text.lower().strip()
         
-        # First try rule-based classification
+        # CRITICAL: Check reference intent FIRST if context exists
+        if has_context:
+            reference_patterns = self.intent_patterns.get('reference', [])
+            for pattern in reference_patterns:
+                if re.search(pattern, text_lower, re.IGNORECASE):
+                    return {
+                        'intent': 'reference',
+                        'confidence': 0.95,
+                        'method': 'rule_based_priority'
+                    }
+        
+        # Then try other rule-based classification
         rule_based_intent = self._rule_based_classification(text_lower)
         if rule_based_intent:
             return {
@@ -208,6 +240,13 @@ SAMPLE_TRAINING_DATA = [
     ("good morning", "greeting"),
     ("hey how are you", "greeting"),
     
+    # Reference queries - NEW
+    ("tell me about the first one", "reference"),
+    ("the second one", "reference"),
+    ("more about that place", "reference"),
+    ("details about it", "reference"),
+    ("what about the last one", "reference"),
+    
     # Destination queries
     ("where should I go", "destination_query"),
     ("suggest a place to visit", "destination_query"),
@@ -220,6 +259,11 @@ SAMPLE_TRAINING_DATA = [
     ("what's my budget", "budget_query"),
     ("is it expensive", "budget_query"),
     ("cheap destinations", "budget_query"),
+    ("under 30k budget", "budget_query"),
+    
+    # Duration queries
+    ("for 5 days", "duration_query"),
+    ("a week long trip", "duration_query"),
     
     # Weather queries
     ("what's the weather like", "weather_query"),

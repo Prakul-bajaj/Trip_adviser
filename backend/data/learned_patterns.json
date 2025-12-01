@@ -1,0 +1,13 @@
+{
+  "intent_patterns": {},
+  "entity_patterns": {},
+  "phrase_mappings": {
+    "good afternoon": "general",
+    "show me beach destinations": "search",
+    "hello!": "general",
+    "under 30000 budget": "search",
+    "for 5 days": "search",
+    "tell me about the first one": "search"
+  },
+  "correction_history": []
+}

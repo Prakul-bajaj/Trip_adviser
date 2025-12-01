@@ -11,7 +11,7 @@ ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1').split(','
 
 # Application definition
 INSTALLED_APPS = [
-    # 'daphne',
+    'daphne',
     
     'django.contrib.admin',
     'django.contrib.auth',
@@ -24,7 +24,7 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt',
     'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
-    # 'channels',
+    'channels',
     
     'users',
     'recommendations',
@@ -39,11 +39,11 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',  # CORS first
     'django.middleware.security.SecurityMiddleware',
-    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
-    'django.middleware.csrf.CsrfViewMiddleware',
+    # CSRF disabled for API
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
@@ -67,9 +67,9 @@ TEMPLATES = [
     },
 ]
 
-WSGI_APPLICATION = 'travel_backend.wsgi.application'
-# ASGI_APPLICATION = 'travel_backend.asgi.application'
-
+# WSGI_APPLICATION = 'travel_backend.wsgi.application'
+ASGI_APPLICATION = 'travel_backend.asgi.application'
+os.environ["DJANGO_ALLOW_ASYNC_UNSAFE"] = "true"
 # MongoDB Database Configuration
 DATABASES = {
     'default': {
@@ -116,6 +116,13 @@ REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': (
         'rest_framework.renderers.JSONRenderer',
     ),
+    'DEFAULT_PARSER_CLASSES': (
+        'rest_framework.parsers.JSONParser',
+        'rest_framework.parsers.FormParser',
+        'rest_framework.parsers.MultiPartParser',
+    ),
+    # Add this to ensure proper handling in ASGI
+    'EXCEPTION_HANDLER': 'rest_framework.views.exception_handler',
 }
 
 # JWT Configuration
@@ -129,31 +136,52 @@ SIMPLE_JWT = {
     'AUTH_HEADER_TYPES': ('Bearer',),
 }
 
+AUTHENTICATION_BACKENDS = [
+    'users.backends.EmailBackend',  # Custom email backend
+    'django.contrib.auth.backends.ModelBackend',  # Default backend
+]
+
 # CORS Configuration
 CORS_ALLOWED_ORIGINS = config('CORS_ALLOWED_ORIGINS', default='http://localhost:3000').split(',')
 CORS_ALLOW_CREDENTIALS = True
-
+CORS_ALLOW_METHODS = [
+    'DELETE',
+    'GET',
+    'OPTIONS',
+    'PATCH',
+    'POST',
+    'PUT',
+]
+CORS_ALLOW_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+]
+CSRF_TRUSTED_ORIGINS = config('CSRF_TRUSTED_ORIGINS', default='http://localhost:3000').split(',')
 # Channels Configuration (for WebSockets)
 CHANNEL_LAYERS = {
     'default': {
         'BACKEND': 'channels_redis.core.RedisChannelLayer',
         'CONFIG': {
-            'hosts': [(config('REDIS_HOST', default='localhost'), 
-                      config('REDIS_PORT', default=6379, cast=int))],
+            'hosts': [('127.0.0.1', 6379)],
         },
     },
 }
 
-# Redis Cache Configuration
 CACHES = {
     'default': {
-        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
-        'LOCATION': f"redis://{config('REDIS_HOST', default='localhost')}:{config('REDIS_PORT', default=6379, cast=int)}/{config('REDIS_DB', default=0, cast=int)}",
-        'OPTIONS': {
-            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
-        },
-        'KEY_PREFIX': 'travel_chatbot',
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'travel-chatbot-cache',
         'TIMEOUT': 3600,
+        'OPTIONS': {
+            'MAX_ENTRIES': 1000
+        }
     }
 }
 
@@ -201,11 +229,13 @@ LOGGING = {
             'class': 'logging.FileHandler',
             'filename': BASE_DIR / 'logs'/'django.log',
             'formatter': 'verbose',
+            'encoding': 'utf-8',
         },
         'console': {
             'level': 'DEBUG',
             'class': 'logging.StreamHandler',
             'formatter': 'verbose',
+            'stream': 'ext://sys.stdout',
         },
     },
     'root': {

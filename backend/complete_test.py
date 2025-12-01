@@ -5,7 +5,7 @@ from collections import defaultdict
 BASE_URL = "http://127.0.0.1:8000"
 
 # Update these credentials
-EMAIL = "user1761677535@example.com"
+EMAIL = "testuser123@example.com"
 PASSWORD = "SecurePass123!"
 TOKEN = None
 

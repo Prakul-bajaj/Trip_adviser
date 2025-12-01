@@ -35,18 +35,19 @@ FAREWELL_RESPONSES = [
 ]
 
 
-# ✅ ADD ONCE at top of views.py
 ACTIVITY_TO_EXPERIENCE_MAP = {
-    'adventure': ['Adventure', 'Trekking', 'Mountain', 'Sports'],
-    'beach': ['Beach', 'Relaxation', 'Water Sports'],
+    'adventure': ['Adventure', 'Trekking'],
+    'beach': ['Beach'],  # ✅ ONLY Beach, nothing else!
     'cultural': ['Cultural', 'Heritage', 'Historical'],
     'wildlife': ['Wildlife', 'Nature', 'Safari'],
     'spiritual': ['Spiritual', 'Religious', 'Pilgrimage'],
     'food': ['Food & Culinary', 'Culinary'],
     'photography': ['Photography', 'Scenic'],
     'relaxation': ['Relaxation', 'Wellness', 'Spa'],
-    'trekking': ['Trekking', 'Adventure', 'Mountain'],
+    'trekking': ['Trekking', 'Adventure'],
     'mountain': ['Mountain', 'Hills', 'Himalayan'],
+    'waterfall': ['Waterfall', 'Nature'],
+    'lake': ['Lake', 'Water'],
 }
 
 @api_view(['POST'])
@@ -172,6 +173,24 @@ def chat(request):
         elif detected_intent == 'reference':
             bot_response = handle_reference_query(request, session, user_message, entities)
         
+        elif detected_intent == 'attractions':
+            # User asking about things to do
+            bot_response = handle_destination_specific_query(
+                request, session, user_message, entities, 'attractions'
+            )
+        
+        elif detected_intent == 'restaurants':
+            # User asking about places to eat
+            bot_response = handle_destination_specific_query(
+                request, session, user_message, entities, 'restaurants'
+            )
+        
+        elif detected_intent == 'accommodations':
+            # User asking about places to stay
+            bot_response = handle_destination_specific_query(
+                request, session, user_message, entities, 'accommodations'
+            )
+        
         else:
             bot_response = handle_general_query(request, session, user_message)
         
@@ -217,6 +236,58 @@ def chat(request):
 
 
 # Handler functions (these stay mostly the same)
+
+def handle_destination_specific_query(request, session, message, entities, query_type):
+    """
+    Route to specific handlers based on query type
+    """
+    from destinations.models import Destination
+    from .context_manager import ConversationContextManager
+    
+    # Try to find destination from message
+    destination = None
+    for dest in Destination.objects.filter(is_active=True):
+        if dest.name.lower() in message.lower():
+            destination = dest
+            break
+    
+    # Check context if not found
+    if not destination:
+        context_mgr = ConversationContextManager(session)
+        context_summary = context_mgr.get_context_summary()
+        dest_ids = context_summary.get('current_destinations', [])
+        
+        if dest_ids:
+            destination = Destination.objects.filter(
+                id=dest_ids[0],
+                is_active=True
+            ).first()
+    
+    if not destination:
+        return {
+            'message': f"Which destination are you asking about? 🤔\n\n"
+                      f"Please mention the place name, for example:\n"
+                      f"• 'Things to do in Goa'\n"
+                      f"• 'Restaurants in Manali'\n"
+                      f"• 'Where to stay in Jaipur'",
+            'suggestions': [
+                "Show me destinations",
+                "Recommend places for me"
+            ],
+            'context': 'need_destination_context'
+        }
+    
+    # Route to appropriate handler
+    if query_type == 'attractions':
+        return handle_attractions_query(request, session, message, destination)
+    elif query_type == 'restaurants':
+        return handle_restaurants_query(request, session, message, destination)
+    elif query_type == 'accommodations':
+        return handle_accommodations_query(request, session, message, destination)
+    else:
+        return handle_more_info(request, session, message)
+
+
 
 def handle_greeting(request, session):
     """Enhanced greeting with user context"""
@@ -266,7 +337,7 @@ def map_activities_to_experiences(activities):
 
 def handle_destination_search_v2(request, session, message, entities):
     """
-    ENHANCED: Context-aware destination search with progressive filtering
+    FIXED: Strict filtering when user explicitly asks for a specific category
     """
     from integrations.weather_api import WeatherAPIClient
     
@@ -276,28 +347,7 @@ def handle_destination_search_v2(request, session, message, entities):
     # Detect if user is changing topic or refining
     topic_detection = context_mgr.detect_topic_change(message, entities)
     
-    # Handle topic change confirmation
-    if topic_detection['action'] == 'confirm':
-        return {
-            'message': f"🤔 {topic_detection['message']}\n\n"
-                      f"Reply 'yes' to switch topics, or tell me more about what you're looking for with {topic_detection['current_topic']}.",
-            'suggestions': [
-                f"Yes, show me {topic_detection['new_topic']}",
-                f"No, continue with {topic_detection['current_topic']}",
-                "Start fresh search"
-            ],
-            'context': 'topic_confirmation_needed',
-            'pending_action': {
-                'action': 'topic_switch',
-                'from': topic_detection['current_topic'],
-                'to': topic_detection['new_topic']
-            }
-        }
-    
-    # Handle explicit topic change
-    if topic_detection['action'] == 'clear':
-        context_mgr.clear_context(keep_preferences=True)
-        logger.info(f"Topic changed from {topic_detection.get('current_topic')} to {topic_detection['new_topic']}")
+    # ... [topic change handling code stays same] ...
     
     # Determine if refining existing search or fresh search
     is_refining = topic_detection['action'] == 'refine'
@@ -305,7 +355,7 @@ def handle_destination_search_v2(request, session, message, entities):
     # Get current destinations if refining
     existing_dest_ids = context_mgr.get_current_destinations() if is_refining else []
     
-    # Extract search parameters FROM ENTITIES (already extracted by NLP engine)
+    # Extract search parameters FROM ENTITIES
     search_query = entities.get('locations', [''])[0] if entities.get('locations') else ''
     activities = entities.get('activities', [])
     budget = entities.get('budget')
@@ -313,7 +363,22 @@ def handle_destination_search_v2(request, session, message, entities):
     weather_pref = entities.get('weather_preference')
     time_frame = entities.get('time_frame')
     
+    # NEW: Get primary activity and filter mode from entities
+    primary_activity = entities.get('primary_activity')  # The MAIN thing user wants
+    filter_mode = entities.get('filter_mode', 'strict')  # strict or relaxed
+    
+    logger.info(f"Search params - Primary: {primary_activity}, Mode: {filter_mode}, Activities: {activities}")
+    
+    # Map activities to experience types
     experience_types = map_activities_to_experiences(activities)
+    
+    # NEW: If there's a primary activity, use ONLY that for strict filtering
+    if primary_activity and filter_mode == 'strict':
+        # Use only the primary activity's experience types
+        primary_experience_types = ACTIVITY_TO_EXPERIENCE_MAP.get(primary_activity.lower(), [])
+        if primary_experience_types:
+            experience_types = primary_experience_types
+            logger.info(f"STRICT MODE: Filtering by primary activity '{primary_activity}' -> {experience_types}")
 
     # PROGRESSIVE FILTERING MODE
     if is_refining and existing_dest_ids:
@@ -360,13 +425,12 @@ def handle_destination_search_v2(request, session, message, entities):
                 destinations = destinations.filter(typical_duration__lte=duration + 1)
             
             if experience_types:
-                filtered_ids = []
-                for dest in destinations:
-                    if dest.experience_types:
-                        if any(any(target.lower() in exp.lower() for target in experience_types) for exp in dest.experience_types):
-                            filtered_ids.append(dest.id)
-                
-                destinations = Destination.objects.filter(id__in=filtered_ids, is_active=True)
+                destinations = apply_experience_filter(
+                    destinations, 
+                    experience_types, 
+                    strict=(filter_mode == 'strict'),
+                    primary_only=(primary_activity is not None)
+                )
             
             expansion_note = f"\n\n💡 I expanded the search slightly to show {destinations.count()} options."
         else:
@@ -388,17 +452,16 @@ def handle_destination_search_v2(request, session, message, entities):
                 Q(description__icontains=search_query)
             )
         
-        # Apply experience type filter
+        # NEW: Apply STRICT experience type filter
         if experience_types:
-            filtered_ids = []
-            for dest in destinations:
-                if dest.experience_types:
-                    for target_exp in experience_types:
-                        if any(target_exp.lower() in exp.lower() for exp in dest.experience_types):
-                            filtered_ids.append(dest.id)
-                            break
+            destinations = apply_experience_filter(
+                destinations, 
+                experience_types, 
+                strict=(filter_mode == 'strict'),
+                primary_only=(primary_activity is not None)
+            )
             
-            destinations = Destination.objects.filter(id__in=filtered_ids, is_active=True)
+            logger.info(f"After experience filter: {destinations.count()} destinations")
         
         # Apply budget filter
         if budget:
@@ -419,6 +482,8 @@ def handle_destination_search_v2(request, session, message, entities):
         
         expansion_note = ""
         filtered_count = destinations.count()
+    
+    # ... [rest of the function stays the same - weather filtering, response building, etc.]
     
     # WEATHER-BASED RANKING (if weather preference given)
     weather_scored_destinations = []
@@ -534,7 +599,10 @@ def handle_destination_search_v2(request, session, message, entities):
         message_text += f"Found {len(destinations_list)} destinations that match:{expansion_note}\n\n"
     else:
         search_context = ""
-        if experience_types:
+        if primary_activity:
+            # Emphasize the primary activity in the message
+            search_context = f" {primary_activity}"
+        elif experience_types:
             main_types = list(set(exp.split()[0] for exp in experience_types[:2]))
             search_context = f" {', '.join(main_types).lower()}"
         
@@ -619,8 +687,62 @@ def handle_destination_search_v2(request, session, message, entities):
     }
 
 
-# ... (rest of handler functions remain the same)
-# I'll show the key changes for other handlers
+# NEW HELPER FUNCTION: Add this right after map_activities_to_experiences
+def apply_experience_filter(destinations, experience_types, strict=True, primary_only=False):
+    """
+    Apply experience type filtering with strict/relaxed modes
+    
+    Args:
+        destinations: QuerySet of destinations
+        experience_types: List of experience types to match
+        strict: If True, destination must have EXACT match for at least one type
+        primary_only: If True, destination must match the primary experience
+    
+    Returns:
+        QuerySet of filtered destinations
+    """
+    filtered_ids = []
+    
+    logger.info(f"Applying experience filter - Strict: {strict}, Primary only: {primary_only}")
+    logger.info(f"Looking for experience types: {experience_types}")
+    
+    for dest in destinations:
+        if not dest.experience_types:
+            continue
+        
+        dest_experiences = [exp.lower().strip() for exp in dest.experience_types]
+        
+        if strict or primary_only:
+            # STRICT MODE: Destination MUST have one of the exact experience types
+            # Example: "Beach" destination must have "Beach" in its experience_types
+            matched = False
+            for target_exp in experience_types:
+                target_lower = target_exp.lower().strip()
+                
+                # Check for EXACT word match (not substring)
+                for dest_exp in dest_experiences:
+                    # Match if target is exact word or at start of dest_exp
+                    if dest_exp == target_lower or dest_exp.startswith(target_lower + ' '):
+                        matched = True
+                        logger.debug(f"✓ {dest.name}: '{dest_exp}' matches '{target_lower}'")
+                        break
+                
+                if matched:
+                    break
+            
+            if matched:
+                filtered_ids.append(dest.id)
+        else:
+            # RELAXED MODE: Destination can have any related experience
+            # Example: "Beach" can match "Beach", "Water Sports", "Relaxation"
+            for target_exp in experience_types:
+                if any(target_exp.lower() in exp.lower() for exp in dest_experiences):
+                    filtered_ids.append(dest.id)
+                    break
+    
+    logger.info(f"Filtered to {len(filtered_ids)} destinations with matching experiences")
+    
+    return Destination.objects.filter(id__in=filtered_ids, is_active=True)
 
 
 def handle_personalized_recommendations(request, session, message, entities):
@@ -1322,27 +1444,49 @@ def handle_itinerary_creation(request, session, message, entities):
         }
 
 
+# chatbot/views.py - ADD/REPLACE this function
+
 def handle_more_info(request, session, message):
-    """Get more info about a destination"""
+    """
+    Get comprehensive information about a destination including:
+    - Basic details
+    - Attractions (things to do)
+    - Restaurants (where to eat)
+    - Accommodations (where to stay)
+    """
+    from destinations.models import Destination
+    from .context_manager import ConversationContextManager
+    
     destinations = Destination.objects.filter(is_active=True)
     found_dest = None
     
+    # Try to find destination from message
     for dest in destinations:
         if dest.name.lower() in message.lower():
             found_dest = dest
             break
     
+    # If not found, check conversation context
     if not found_dest:
         context_mgr = ConversationContextManager(session)
         context_summary = context_mgr.get_context_summary()
         mentioned = context_summary.get('mentioned_destinations', [])
+        
         if mentioned:
             last_dest_name = mentioned[-1]
             found_dest = Destination.objects.filter(
                 name__icontains=last_dest_name,
                 is_active=True
             ).first()
-        recent_messages = Message.objects.filter(session=session, sender='bot').order_by('-timestamp')[:3]
+    
+    # Still not found? Check recent bot messages
+    if not found_dest:
+        from .models import Message
+        recent_messages = Message.objects.filter(
+            session=session,
+            sender='bot'
+        ).order_by('-timestamp')[:5]
+        
         for msg in recent_messages:
             for dest in destinations:
                 if dest.name.lower() in msg.content.lower():
@@ -1353,37 +1497,414 @@ def handle_more_info(request, session, message):
     
     if not found_dest:
         return {
-            'message': "Which destination would you like to know more about? 🤔",
-            'suggestions': ["Tell me about Goa", "More about Manali", "Show all destinations"],
+            'message': "Which destination would you like to know more about? 🤔\n\n"
+                      "Please tell me the name of the place you're interested in!",
+            'suggestions': [
+                "Tell me about Goa",
+                "More about Manali",
+                "Show all destinations"
+            ],
             'context': 'need_clarification'
         }
     
-    message_text = f"**{found_dest.name}, {found_dest.state}** ✨\n\n{found_dest.description}\n\n"
+    # Build comprehensive destination information
+    message_text = f"**{found_dest.name}, {found_dest.state}** ✨\n\n"
+    message_text += f"{found_dest.description}\n\n"
+    
+    # Basic Information
     message_text += "**📍 Key Information:**\n"
-    message_text += f"• Best Time: {', '.join(found_dest.best_time_to_visit[:3]) if found_dest.best_time_to_visit else 'Year-round'}\n"
-    message_text += f"• Typical Stay: {found_dest.typical_duration} days\n"
-    message_text += f"• Budget: ₹{found_dest.budget_range_min:,} - ₹{found_dest.budget_range_max:,}\n"
-    message_text += f"• Climate: {found_dest.climate_type}\n"
-    message_text += f"• Difficulty: {found_dest.difficulty_level.title()}\n\n"
+    message_text += f"• **Best Time:** {', '.join(found_dest.best_time_to_visit[:3]) if found_dest.best_time_to_visit else 'Year-round'}\n"
+    message_text += f"• **Typical Stay:** {found_dest.typical_duration} days\n"
+    message_text += f"• **Budget:** ₹{found_dest.budget_range_min:,} - ₹{found_dest.budget_range_max:,}\n"
+    message_text += f"• **Climate:** {found_dest.climate_type}\n"
+    message_text += f"• **Difficulty:** {found_dest.difficulty_level.title()}\n"
+    message_text += f"• **Safety Rating:** {found_dest.safety_rating}/5.0 ⭐\n\n"
     
+    # Experiences
     if found_dest.experience_types:
-        message_text += f"**🎯 Experiences:**\n{', '.join(found_dest.experience_types[:5])}\n\n"
+        message_text += f"**🎯 Experiences:**\n"
+        message_text += f"{', '.join(found_dest.experience_types[:6])}\n\n"
     
+    # Getting There
     message_text += f"**✈️ Getting There:**\n"
     if found_dest.nearest_airport:
-        message_text += f"• Airport: {found_dest.nearest_airport}\n"
+        message_text += f"• **Airport:** {found_dest.nearest_airport}\n"
     if found_dest.nearest_railway_station:
-        message_text += f"• Railway: {found_dest.nearest_railway_station}\n\n"
+        message_text += f"• **Railway:** {found_dest.nearest_railway_station}\n"
+    message_text += "\n"
     
-    message_text += "Would you like to plan a trip here?"
+    # ============================================================
+    # ATTRACTIONS - Things to Do
+    # ============================================================
+    attractions = found_dest.destination_attractions.all()
+    
+    if attractions.exists():
+        message_text += f"**🎪 Things to Do ({attractions.count()} attractions):**\n\n"
+        
+        # Group by type for better organization
+        from collections import defaultdict
+        attractions_by_type = defaultdict(list)
+        
+        for attraction in attractions[:10]:  # Show top 10
+            attractions_by_type[attraction.type].append(attraction)
+        
+        for attr_type, attrs in attractions_by_type.items():
+            message_text += f"*{attr_type}:*\n"
+            for attr in attrs[:3]:  # Top 3 per type
+                rating_stars = "⭐" * int(float(attr.rating)) if attr.rating else ""
+                message_text += f"  • **{attr.name}** {rating_stars}\n"
+                message_text += f"    {attr.description[:60]}...\n"
+            message_text += "\n"
+    else:
+        message_text += "**🎪 Things to Do:**\n"
+        message_text += "_Attraction details coming soon!_\n\n"
+    
+    # ============================================================
+    # RESTAURANTS - Where to Eat
+    # ============================================================
+    restaurants = found_dest.destination_restaurants.all()
+    
+    if restaurants.exists():
+        message_text += f"**🍽️ Where to Eat ({restaurants.count()} restaurants):**\n\n"
+        
+        # Group by cuisine
+        cuisines = {}
+        for restaurant in restaurants[:8]:  # Show top 8
+            cuisine = restaurant.cuisine
+            if cuisine not in cuisines:
+                cuisines[cuisine] = []
+            cuisines[cuisine].append(restaurant)
+        
+        for cuisine, rest_list in list(cuisines.items())[:4]:  # Top 4 cuisines
+            message_text += f"*{cuisine} Cuisine:*\n"
+            for rest in rest_list[:2]:  # Top 2 per cuisine
+                rating_stars = "⭐" * int(float(rest.rating)) if rest.rating else ""
+                message_text += f"  • **{rest.name}** {rating_stars}\n"
+            message_text += "\n"
+    else:
+        message_text += "**🍽️ Where to Eat:**\n"
+        message_text += "_Restaurant recommendations coming soon!_\n\n"
+    
+    # ============================================================
+    # ACCOMMODATIONS - Where to Stay
+    # ============================================================
+    accommodations = found_dest.destination_accommodations.all()
+    
+    if accommodations.exists():
+        message_text += f"**🏨 Where to Stay ({accommodations.count()} options):**\n\n"
+        
+        # Group by type (Luxury, Hotel, Budget, etc.)
+        acc_by_type = defaultdict(list)
+        
+        for accommodation in accommodations[:8]:  # Show top 8
+            acc_by_type[accommodation.type].append(accommodation)
+        
+        for acc_type, acc_list in list(acc_by_type.items())[:4]:  # Top 4 types
+            message_text += f"*{acc_type}:*\n"
+            for acc in acc_list[:2]:  # Top 2 per type
+                rating_stars = "⭐" * int(float(acc.rating)) if acc.rating else ""
+                message_text += f"  • **{acc.name}** {rating_stars}\n"
+            message_text += "\n"
+    else:
+        message_text += "**🏨 Where to Stay:**\n"
+        message_text += "_Accommodation options coming soon!_\n\n"
+    
+    # ============================================================
+    # Additional Details
+    # ============================================================
+    
+    # Weather Note (if applicable)
+    if found_dest.avoid_months:
+        message_text += f"**⚠️ Note:** Avoid visiting in {', '.join(found_dest.avoid_months[:3])} (monsoon/off-season)\n\n"
+    
+    # Call to Action
+    message_text += "**What would you like to do next?**"
+    
+    # Prepare structured data for frontend
+    destination_data = {
+        'id': str(found_dest.id),
+        'name': found_dest.name,
+        'state': found_dest.state,
+        'description': found_dest.description,
+        'budget': {
+            'min': found_dest.budget_range_min,
+            'max': found_dest.budget_range_max
+        },
+        'duration': found_dest.typical_duration,
+        'best_time': found_dest.best_time_to_visit,
+        'experiences': found_dest.experience_types,
+        'safety_rating': found_dest.safety_rating,
+        'attractions': [
+            {
+                'name': attr.name,
+                'type': attr.type,
+                'description': attr.description,
+                'rating': float(attr.rating) if attr.rating else None
+            }
+            for attr in attractions[:10]
+        ] if attractions.exists() else [],
+        'restaurants': [
+            {
+                'name': rest.name,
+                'cuisine': rest.cuisine,
+                'rating': float(rest.rating) if rest.rating else None
+            }
+            for rest in restaurants[:8]
+        ] if restaurants.exists() else [],
+        'accommodations': [
+            {
+                'name': acc.name,
+                'type': acc.type,
+                'rating': float(acc.rating) if acc.rating else None
+            }
+            for acc in accommodations[:8]
+        ] if accommodations.exists() else []
+    }
+    
+    # Generate context-aware suggestions
+    suggestions = [
+        f"Plan trip to {found_dest.name}",
+        f"Weather in {found_dest.name}",
+        f"Save {found_dest.name}",
+    ]
+    
+    # Add specific suggestions based on available data
+    if attractions.exists():
+        top_attraction = attractions.first()
+        suggestions.append(f"Tell me about {top_attraction.name}")
+    
+    if restaurants.exists():
+        suggestions.append(f"Best restaurants in {found_dest.name}")
+    
+    if accommodations.exists():
+        suggestions.append("Where to stay")
+    
+    suggestions.append("Show similar places")
     
     return {
         'message': message_text,
-        'destination': {'id': str(found_dest.id), 'name': found_dest.name, 'state': found_dest.state},
-        'suggestions': [f"Plan trip to {found_dest.name}", f"Weather in {found_dest.name}", f"Save {found_dest.name}"],
-        'context': 'destination_details'
+        'destination': destination_data,
+        'has_attractions': attractions.exists(),
+        'has_restaurants': restaurants.exists(),
+        'has_accommodations': accommodations.exists(),
+        'attractions_count': attractions.count() if attractions.exists() else 0,
+        'restaurants_count': restaurants.count() if restaurants.exists() else 0,
+        'accommodations_count': accommodations.count() if accommodations.exists() else 0,
+        'suggestions': suggestions[:6],  # Top 6 suggestions
+        'context': 'destination_details_complete'
     }
 
+def handle_attractions_query(request, session, message, destination):
+    """
+    Handle queries specifically about attractions/things to do
+    Example: "What can I do in Goa?", "Show me attractions in Manali"
+    """
+    attractions = destination.destination_attractions.all().order_by('-rating')
+    
+    if not attractions.exists():
+        return {
+            'message': f"I don't have specific attraction details for {destination.name} yet. 😔\n\n"
+                      f"But {destination.name} is known for:\n"
+                      f"{', '.join(destination.experience_types[:5]) if destination.experience_types else 'amazing experiences'}!\n\n"
+                      f"Would you like me to:\n"
+                      f"• Plan a trip to {destination.name}\n"
+                      f"• Show similar destinations\n"
+                      f"• Check weather conditions",
+            'suggestions': [
+                f"Plan trip to {destination.name}",
+                f"Weather in {destination.name}",
+                "Show similar places"
+            ],
+            'context': 'no_attractions_data'
+        }
+    
+    message_text = f"**🎪 Things to Do in {destination.name}**\n\n"
+    message_text += f"Here are the top {min(attractions.count(), 10)} attractions:\n\n"
+    
+    # Group by type
+    from collections import defaultdict
+    by_type = defaultdict(list)
+    
+    for attr in attractions[:15]:
+        by_type[attr.type].append(attr)
+    
+    for attr_type, attrs in by_type.items():
+        message_text += f"**{attr_type}** ({len(attrs)} places)\n"
+        for i, attr in enumerate(attrs[:5], 1):
+            rating_display = f"{attr.rating}⭐" if attr.rating else "New"
+            message_text += f"{i}. **{attr.name}** - {rating_display}\n"
+            message_text += f"   {attr.description}\n"
+        message_text += "\n"
+    
+    message_text += f"💡 *Total {attractions.count()} attractions available in {destination.name}*"
+    
+    return {
+        'message': message_text,
+        'destination': {
+            'id': str(destination.id),
+            'name': destination.name,
+            'state': destination.state
+        },
+        'attractions': [
+            {
+                'name': attr.name,
+                'type': attr.type,
+                'description': attr.description,
+                'rating': float(attr.rating) if attr.rating else None
+            }
+            for attr in attractions[:15]
+        ],
+        'suggestions': [
+            f"Tell me about {attractions.first().name}",
+            "Where to eat here",
+            "Where to stay",
+            f"Plan trip to {destination.name}"
+        ],
+        'context': 'attractions_shown'
+    }
+
+
+def handle_restaurants_query(request, session, message, destination):
+    """
+    Handle queries about restaurants/food
+    Example: "Where can I eat in Goa?", "Best restaurants in Manali"
+    """
+    restaurants = destination.destination_restaurants.all().order_by('-rating')
+    
+    if not restaurants.exists():
+        return {
+            'message': f"I don't have specific restaurant details for {destination.name} yet. 😔\n\n"
+                      f"However, {destination.name} is known for its local cuisine!\n\n"
+                      f"Would you like to:\n"
+                      f"• Explore things to do in {destination.name}\n"
+                      f"• Find where to stay\n"
+                      f"• Plan your trip",
+            'suggestions': [
+                f"Things to do in {destination.name}",
+                "Where to stay",
+                f"Plan trip to {destination.name}"
+            ],
+            'context': 'no_restaurant_data'
+        }
+    
+    message_text = f"**🍽️ Where to Eat in {destination.name}**\n\n"
+    message_text += f"I found {restaurants.count()} great dining options!\n\n"
+    
+    # Group by cuisine
+    cuisines = {}
+    for rest in restaurants[:20]:
+        cuisine = rest.cuisine
+        if cuisine not in cuisines:
+            cuisines[cuisine] = []
+        cuisines[cuisine].append(rest)
+    
+    for cuisine, rest_list in cuisines.items():
+        message_text += f"**{cuisine} Cuisine** ({len(rest_list)} restaurants)\n"
+        for i, rest in enumerate(rest_list[:4], 1):
+            rating_display = f"{rest.rating}⭐" if rest.rating else "New"
+            message_text += f"{i}. **{rest.name}** - {rating_display}\n"
+        message_text += "\n"
+    
+    # Add dining tips
+    message_text += f"💡 *Try the local {destination.state} specialties!*"
+    
+    return {
+        'message': message_text,
+        'destination': {
+            'id': str(destination.id),
+            'name': destination.name,
+            'state': destination.state
+        },
+        'restaurants': [
+            {
+                'name': rest.name,
+                'cuisine': rest.cuisine,
+                'rating': float(rest.rating) if rest.rating else None
+            }
+            for rest in restaurants[:20]
+        ],
+        'suggestions': [
+            "Where to stay here",
+            "Things to do here",
+            f"Plan {destination.typical_duration}-day trip",
+            "Show me the map"
+        ],
+        'context': 'restaurants_shown'
+    }
+
+def handle_accommodations_query(request, session, message, destination):
+    """
+    Handle queries about accommodations/hotels
+    Example: "Where to stay in Goa?", "Hotels in Manali"
+    """
+    accommodations = destination.destination_accommodations.all().order_by('-rating')
+    
+    if not accommodations.exists():
+        return {
+            'message': f"I don't have specific accommodation details for {destination.name} yet. 😔\n\n"
+                      f"But there are usually options from budget to luxury!\n"
+                      f"Typical budget: ₹{destination.budget_range_min:,} - ₹{destination.budget_range_max:,}\n\n"
+                      f"Would you like to:\n"
+                      f"• Explore things to do in {destination.name}\n"
+                      f"• Find places to eat\n"
+                      f"• Plan your trip",
+            'suggestions': [
+                f"Things to do in {destination.name}",
+                "Where to eat",
+                f"Plan trip to {destination.name}"
+            ],
+            'context': 'no_accommodation_data'
+        }
+    
+    message_text = f"**🏨 Where to Stay in {destination.name}**\n\n"
+    message_text += f"I found {accommodations.count()} accommodation options!\n\n"
+    
+    # Group by type
+    from collections import defaultdict
+    by_type = defaultdict(list)
+    
+    for acc in accommodations[:20]:
+        by_type[acc.type].append(acc)
+    
+    # Define order preference
+    type_order = ['Luxury Resort', 'Boutique/Luxury', 'Hotel', 'Budget Hotel', 
+                  'Homestay', 'Guest House', 'Villa', 'Cottage', 'Hostel']
+    
+    for acc_type in type_order:
+        if acc_type in by_type:
+            acc_list = by_type[acc_type]
+            message_text += f"**{acc_type}** ({len(acc_list)} options)\n"
+            for i, acc in enumerate(acc_list[:4], 1):
+                rating_display = f"{acc.rating}⭐" if acc.rating else "New"
+                message_text += f"{i}. **{acc.name}** - {rating_display}\n"
+            message_text += "\n"
+    
+    # Add budget note
+    message_text += f"💰 *Budget range: ₹{destination.budget_range_min:,} - ₹{destination.budget_range_max:,} for {destination.typical_duration} days*"
+    
+    return {
+        'message': message_text,
+        'destination': {
+            'id': str(destination.id),
+            'name': destination.name,
+            'state': destination.state
+        },
+        'accommodations': [
+            {
+                'name': acc.name,
+                'type': acc.type,
+                'rating': float(acc.rating) if acc.rating else None
+            }
+            for acc in accommodations[:20]
+        ],
+        'suggestions': [
+            "Where to eat here",
+            "Things to do here",
+            f"Plan {destination.typical_duration}-day trip",
+            f"Book trip to {destination.name}"
+        ],
+        'context': 'accommodations_shown'
+    }
 
 def handle_general_query(request, session, message):
     """Handle general/unclear queries"""

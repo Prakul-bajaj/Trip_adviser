@@ -9,6 +9,7 @@ from .models import UserRecommendation, UserBookmark, TravelAdvisory
 from .serializers import (
     DestinationSerializer, 
     DestinationListSerializer,
+    DestinationSearchSerializer,
     AttractionSerializer,
     RestaurantSerializer,
     AccommodationSerializer,

@@ -6,28 +6,25 @@ from .models import UserRecommendation, UserBookmark, TravelAdvisory
 class AttractionSerializer(serializers.ModelSerializer):
     class Meta:
         model = Attraction
-        fields = ['id', 'name', 'description', 'category', 'rating', 'typical_visit_duration', 
-                  'entry_fee', 'latitude', 'longitude', 'images']
+        fields = ['id', 'name', 'type', 'description', 'rating']
 
 
 class RestaurantSerializer(serializers.ModelSerializer):
     class Meta:
         model = Restaurant
-        fields = ['id', 'name', 'cuisine_types', 'description', 'rating', 'price_range', 
-                  'average_cost_for_two', 'dietary_options', 'latitude', 'longitude', 'address']
+        fields = ['id', 'name', 'cuisine', 'rating']
 
 
 class AccommodationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Accommodation
-        fields = ['id', 'name', 'type', 'description', 'rating', 'price_range_min', 
-                  'price_range_max', 'budget_category', 'amenities', 'latitude', 'longitude', 'address']
+        fields = ['id', 'name', 'type', 'rating']
 
 
 class DestinationSerializer(serializers.ModelSerializer):
-    attractions = AttractionSerializer(many=True, read_only=True)
-    restaurants = RestaurantSerializer(many=True, read_only=True)
-    accommodations = AccommodationSerializer(many=True, read_only=True)
+    attractions = AttractionSerializer(many=True, read_only=True, source='destination_attractions')
+    restaurants = RestaurantSerializer(many=True, read_only=True, source='destination_restaurants')
+    accommodations = AccommodationSerializer(many=True, read_only=True, source='destination_accommodations')
     
     class Meta:
         model = Destination
@@ -38,10 +35,16 @@ class DestinationListSerializer(serializers.ModelSerializer):
     """Lighter serializer for list views"""
     class Meta:
         model = Destination
-        fields = ['id', 'name', 'state', 'country', 'description', 'latitude', 'longitude',
-                  'popularity_score', 'rating', 'difficulty_level', 'budget_range_min', 
-                  'budget_range_max', 'best_time_to_visit', 'images']
-        read_only_fields = ['id', 'popularity_score', 'rating']
+        fields = [
+            'id', 'name', 'state', 'country', 'description', 
+            'geography_types', 'experience_types', 'landscape_types',
+            'budget_range_min', 'budget_range_max', 'typical_duration',
+            'best_time_to_visit', 'difficulty_level', 'safety_rating', 
+            'popularity_score', 'latitude', 'longitude', 'altitude',
+            'climate_type', 'nearest_airport', 'nearest_railway_station'
+        ]
+        read_only_fields = ['id', 'popularity_score', 'safety_rating']
+
 
 class UserRecommendationSerializer(serializers.ModelSerializer):
     destination = DestinationListSerializer(read_only=True)
@@ -69,6 +72,7 @@ class TravelAdvisorySerializer(serializers.ModelSerializer):
     class Meta:
         model = TravelAdvisory
         fields = '__all__'
+
 
 class DestinationSearchSerializer(serializers.Serializer):
     """Serializer for destination search filters"""
