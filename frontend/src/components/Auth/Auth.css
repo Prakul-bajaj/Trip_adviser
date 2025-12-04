@@ -17,6 +17,10 @@
   animation: slideUp 0.4s ease-out;
 }
 
+
+
+
+
 @keyframes slideUp {
   from {
     opacity: 0;

@@ -1,77 +1,59 @@
+/* Add this to your App.css or create a new global.css */
+
+/* Reset and prevent page scrolling */
 * {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
 }
 
-body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  background: #f7fafc;
+html, body {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden; /* Prevent page scroll */
 }
 
-code {
-  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
-    monospace;
-}
-
-.loading-screen {
+#root {
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
+}
+
+/* Layout container for pages with navbar */
+.app-layout {
+  display: flex;
+  flex-direction: column;
   height: 100vh;
-  background: #f7fafc;
+  overflow: hidden;
 }
 
-.spinner-large {
-  width: 48px;
-  height: 48px;
-  border: 4px solid #e2e8f0;
-  border-top-color: #667eea;
-  border-radius: 50%;
-  animation: spin 1s linear infinite;
+/* Navbar fixed at top */
+.app-navbar {
+  flex-shrink: 0;
+  height: 60px; /* Adjust based on your navbar height */
+  z-index: 1000;
 }
 
-@keyframes spin {
-  to { transform: rotate(360deg); }
+/* Main content area - fills remaining space */
+.app-content {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  position: relative;
 }
 
-.loading-screen p {
-  margin-top: 20px;
-  color: #718096;
-  font-size: 16px;
-}
-
-/* Scrollbar Styles */
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-
-::-webkit-scrollbar-track {
-  background: #f7fafc;
-}
-
-::-webkit-scrollbar-thumb {
-  background: #cbd5e0;
-  border-radius: 4px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: #a0aec0;
-}
-
-/* Global Button Styles */
-button {
-  font-family: inherit;
-}
-
-/* Selection Color */
-::selection {
-  background: rgba(102, 126, 234, 0.2);
-  color: inherit;
+/* Chat page specific - no navbar offset needed */
+.chat-page {
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
 }
