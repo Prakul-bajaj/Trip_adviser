@@ -9,8 +9,13 @@ from django.core.cache import cache
 from django.conf import settings
 import spacy
 import google.generativeai as genai
+import os
 
 logger = logging.getLogger(__name__)
+
+# Suppress GRPC warnings
+os.environ['GRPC_VERBOSITY'] = 'ERROR'
+os.environ['GLOG_minloglevel'] = '2'
 
 
 class HybridNLPEngine:
@@ -19,22 +24,36 @@ class HybridNLPEngine:
     1. spaCy for entity extraction (fast, local)
     2. Gemini API for intent classification and safety (free, accurate)
     3. Learning mechanism from user interactions
+    4. Location context memory for smart reference resolution
     """
     
     def __init__(self):
         # Initialize spaCy
         try:
             self.nlp = spacy.load("en_core_web_sm")
-            logger.info("spaCy loaded successfully")
+            logger.info("✓ spaCy loaded successfully")
         except OSError:
             logger.warning("⚠️ spaCy model not found. Run: python -m spacy download en_core_web_sm")
             self.nlp = None
         
-        # Initialize Gemini
+        # Initialize Gemini with proper error handling
+        self.gemini_model = None
         try:
-            genai.configure(api_key=settings.GEMINI_API_KEY)
-            self.gemini_model = genai.GenerativeModel('gemini-2.5-flash')
-            logger.info("Gemini API configured")
+            api_key = getattr(settings, 'GEMINI_API_KEY', None)
+            if api_key and api_key != 'your-api-key-here':
+                genai.configure(api_key=api_key)
+                self.gemini_model = genai.GenerativeModel(
+                    'gemini-2.5-flash',  # Using latest stable model
+                    generation_config={
+                        'temperature': 0.7,
+                        'top_p': 0.95,
+                        'top_k': 40,
+                        'max_output_tokens': 1024,
+                    }
+                )
+                logger.info("✓ Gemini API configured successfully")
+            else:
+                logger.warning("⚠️ GEMINI_API_KEY not configured. Using fallback classification.")
         except Exception as e:
             logger.error(f"❌ Gemini initialization failed: {e}")
             self.gemini_model = None
@@ -58,8 +77,11 @@ class HybridNLPEngine:
         
         pattern_file = settings.BASE_DIR / 'data' / 'learned_patterns.json'
         if pattern_file.exists():
-            with open(pattern_file, 'r') as f:
-                return json.load(f)
+            try:
+                with open(pattern_file, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Error loading patterns: {e}")
         
         return {
             'intent_patterns': {},
@@ -70,29 +92,119 @@ class HybridNLPEngine:
     
     def _save_learned_patterns(self):
         """Save learned patterns to cache"""
-        cache.set('nlp_learned_patterns', json.dumps(self.learned_patterns), timeout=None)
-        pattern_file = settings.BASE_DIR / 'data' / 'learned_patterns.json'
-        pattern_file.parent.mkdir(exist_ok=True)
-        with open(pattern_file, 'w') as f:
-            json.dump(self.learned_patterns, f, indent=2)
+        try:
+            cache.set('nlp_learned_patterns', json.dumps(self.learned_patterns), timeout=None)
+            pattern_file = settings.BASE_DIR / 'data' / 'learned_patterns.json'
+            pattern_file.parent.mkdir(exist_ok=True)
+            with open(pattern_file, 'w') as f:
+                json.dump(self.learned_patterns, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving patterns: {e}")
+
+    def _detect_tell_me_about_query(self, message: str, entities: Dict) -> Optional[Dict]:
+        """
+        Detect "Tell me about X" queries where X is a destination
+        Examples:
+        - "Tell me about Goa"
+        - "Tell me more about Manali"
+        - "What about Kerala?"
+        - "Info about Delhi"
+        """
+        message_lower = message.lower().strip()
+        
+        # Patterns for "tell me about" queries
+        tell_me_patterns = [
+            r'\b(tell me|tell me more|info|information|details|describe)\s+(about|on)\s+(\w+)',
+            r'\bwhat about\s+(\w+)',
+            r'\bhow about\s+(\w+)',
+            r'\b(\w+)\s+info\b',
+        ]
+        
+        location_mentioned = None
+        
+        # Check if it matches any pattern
+        for pattern in tell_me_patterns:
+            match = re.search(pattern, message_lower)
+            if match:
+                # Extract the location name (last captured group)
+                groups = match.groups()
+                potential_location = groups[-1]
+                
+                # Check if this is a valid destination name
+                from destinations.models import Destination
+                all_destinations = cache.get('all_destination_names_lower')
+                if not all_destinations:
+                    all_destinations = {d.lower(): d for d in Destination.objects.values_list('name', flat=True)}
+                    cache.set('all_destination_names_lower', all_destinations, 3600)
+                
+                # Check if mentioned word is a destination
+                for dest_lower, dest_name in all_destinations.items():
+                    if potential_location in dest_lower or dest_lower in potential_location:
+                        location_mentioned = dest_name
+                        break
+                
+                if location_mentioned:
+                    break
+        
+        # Also check entities for location
+        if not location_mentioned and entities.get('locations'):
+            location_mentioned = entities['locations'][0]
+        
+        # If we found a location, return more_info intent
+        if location_mentioned:
+            return {
+                'message': message,
+                'entities': {**entities, 'location': {'name': location_mentioned}},
+                'intent': 'more_info',
+                'confidence': 0.95,
+                'is_safe': True,
+                'safety_issues': [],
+                'context_understanding': f"User asking for information about {location_mentioned}",
+                'suggested_response_type': 'informative',
+                'source': 'tell_me_about_detection',
+                'location_context': {
+                    'name': location_mentioned,
+                    'source': 'direct_mention',
+                    'confidence': 0.95
+                },
+                'timestamp': datetime.now().isoformat()
+            }
+        
+        return None
+
     
     def process_message(self, message: str, user_id: str, session_context: Dict = None) -> Dict[str, Any]:
         """
-        Main processing pipeline with REFERENCE DETECTION PRIORITY
+        Main processing pipeline with SMART REFERENCE DETECTION
+        Priority: Location Context > Result References > General Queries
         """
         message_clean = message.strip()
         
         # Step 1: Check cache
-        cached_result = self._check_cache(message_clean)
+        cached_result = self._check_cache(message_clean, str(session_context))
         if cached_result:
-            logger.info(f"Cache hit for: {message_clean[:50]}")
+            logger.info(f"✓ Cache hit for: {message_clean[:50]}")
             return cached_result
         
-        # Step 2: Extract entities
-        entities = self._extract_entities_spacy(message_clean)
+        # Step 2: Extract entities with LOCATION MEMORY
+        entities = self._extract_entities_spacy(message_clean, session_context)
+
+        tell_me_result = self._detect_tell_me_about_query(message_clean, entities)
+        if tell_me_result:
+            logger.info(f"🎯 TELL ME ABOUT QUERY: {tell_me_result.get('location_context', {}).get('name')}")
+            return tell_me_result
         
-        # Step 3: PRIORITY CHECK - Reference Resolution
-        # If user says "the first one", "tell me about it", etc.
+        # Step 3: PRIORITY 1 - Location-specific query detection
+        # If user asks "restaurants in X" or mentions a location they discussed before
+        location_specific_intent = self._detect_location_specific_intent(
+            message_clean, entities, session_context
+        )
+        
+        if location_specific_intent:
+            logger.info(f"🎯 LOCATION-SPECIFIC QUERY: {location_specific_intent['intent']} for {location_specific_intent.get('location')}")
+            return location_specific_intent
+        
+        # Step 4: PRIORITY 2 - Reference to previous results
         if session_context and session_context.get('current_destinations'):
             if self._is_reference_query(message_clean):
                 logger.info(f"🎯 REFERENCE DETECTED: {message_clean}")
@@ -109,10 +221,10 @@ class HybridNLPEngine:
                     'timestamp': datetime.now().isoformat()
                 }
         
-        # Step 4: Check learned patterns
+        # Step 5: Check learned patterns
         learned_intent = self._check_learned_patterns(message_clean)
         
-        # Step 5: Gemini for intent + safety
+        # Step 6: Gemini for intent + safety (with improved error handling)
         gemini_result = self._analyze_with_gemini(message_clean, entities, session_context)
         
         # Combine results
@@ -125,14 +237,152 @@ class HybridNLPEngine:
             'safety_issues': gemini_result.get('safety_issues', []),
             'context_understanding': gemini_result.get('context_understanding', ''),
             'suggested_response_type': gemini_result.get('suggested_response_type', 'neutral'),
-            'source': 'learned' if learned_intent else 'gemini',
+            'source': 'learned' if learned_intent else gemini_result.get('source', 'gemini'),
             'timestamp': datetime.now().isoformat()
         }
         
         # Cache result
-        self._cache_result(message_clean, final_result)
+        self._cache_result(message_clean, final_result, str(session_context))
         
         return final_result
+    
+    def _detect_location_specific_intent(self, message: str, entities: Dict, 
+                                         session_context: Dict = None) -> Optional[Dict]:
+        """
+        NEW: Detect location-specific queries like:
+        - "restaurants in Goa"
+        - "where to stay" (when Goa was just discussed)
+        - "things to do there" (referring to last mentioned place)
+        """
+        message_lower = message.lower().strip()
+        
+        # Extract mentioned location from message OR context
+        mentioned_location = self._extract_location_from_context(message, entities, session_context)
+        
+        if not mentioned_location:
+            return None
+        
+        # Check for specific intent patterns with location
+        intent_patterns = {
+            'attractions': [
+                r'\b(things to do|what to do|activities|attractions|places to visit|sightseeing|tourist places|visit)\b',
+                r'\b(see|explore|check out)\b(?!.*\bshow\b)',  # "what to see" but not "show me"
+            ],
+            'restaurants': [
+                r'\b(restaurant|restaurants|food|eat|eating|dining|cuisine|cafes?|places to eat|where to eat|best food)\b',
+            ],
+            'accommodations': [
+                r'\b(hotel|hotels|stay|staying|accommodation|lodging|where to stay|places to stay|guest house|resort|hostel)\b',
+            ],
+            'weather': [
+                r'\b(weather|temperature|climate|forecast|rain|sunny|cold|hot)\b',
+            ],
+            'safety': [
+                r'\b(safe|safety|secure|dangerous|is it safe)\b',
+            ],
+        }
+        
+        detected_intent = None
+        for intent, patterns in intent_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, message_lower):
+                    detected_intent = intent
+                    break
+            if detected_intent:
+                break
+        
+        if detected_intent:
+            return {
+                'message': message,
+                'entities': {**entities, 'location': mentioned_location},
+                'intent': detected_intent,
+                'confidence': 0.95,
+                'is_safe': True,
+                'safety_issues': [],
+                'context_understanding': f"User asking about {detected_intent} in {mentioned_location['name']}",
+                'suggested_response_type': 'informative',
+                'source': 'location_specific_detection',
+                'location_context': mentioned_location,
+                'timestamp': datetime.now().isoformat()
+            }
+        
+        return None
+    
+    def _extract_location_from_context(self, message: str, entities: Dict, 
+                                       session_context: Dict = None) -> Optional[Dict]:
+        """
+        Extract location from:
+        1. Direct mention in message ("restaurants in Goa")
+        2. Session context (last discussed location)
+        3. Reference words (there, it, that place)
+        """
+        message_lower = message.lower()
+        
+        # Priority 1: Direct location mention in message
+        if entities.get('locations'):
+            location_name = entities['locations'][0]
+            return {
+                'name': location_name,
+                'source': 'direct_mention',
+                'confidence': 0.95
+            }
+        
+        # Priority 2: Check for location names in message (fuzzy matching)
+        # This catches cases like "Manali" even if spaCy missed it
+        from destinations.models import Destination
+        all_destinations = cache.get('all_destination_names')
+        if not all_destinations:
+            all_destinations = list(Destination.objects.values_list('name', flat=True))
+            cache.set('all_destination_names', all_destinations, 3600)
+        
+        for dest_name in all_destinations:
+            if dest_name.lower() in message_lower:
+                return {
+                    'name': dest_name,
+                    'source': 'fuzzy_match',
+                    'confidence': 0.90
+                }
+        
+        # Priority 3: Reference words pointing to context
+        reference_words = ['there', 'it', 'that place', 'this place', 'the place']
+        has_reference = any(word in message_lower for word in reference_words)
+        
+        if has_reference and session_context:
+            last_location = session_context.get('last_discussed_location')
+            if last_location:
+                return {
+                    'name': last_location.get('name'),
+                    'id': last_location.get('id'),
+                    'source': 'context_reference',
+                    'confidence': 0.85
+                }
+        
+        # Priority 4: Last discussed location in context (implicit)
+        if session_context:
+            last_location = session_context.get('last_discussed_location')
+            
+            # Only use context if message is asking location-specific question
+            location_specific_words = [
+                'restaurant', 'hotel', 'stay', 'eat', 'food', 'accommodation',
+                'things to do', 'activities', 'attractions', 'weather', 'safe'
+            ]
+            
+            is_location_question = any(word in message_lower for word in location_specific_words)
+            
+            if last_location and is_location_question:
+                # Check if it's NOT a new search query
+                search_indicators = ['show', 'find', 'search', 'looking for', 'give me', 'suggest']
+                is_new_search = any(word in message_lower for word in search_indicators)
+                
+                if not is_new_search:
+                    return {
+                        'name': last_location.get('name'),
+                        'id': last_location.get('id'),
+                        'source': 'implicit_context',
+                        'confidence': 0.75
+                    }
+        
+        return None
     
     def _is_reference_query(self, message: str) -> bool:
         """
@@ -149,14 +399,14 @@ class HybridNLPEngine:
             
             # Pronoun references
             r'\b(tell me|more about|info about|details about|show me)\s+(the )?(first|second|it|that|this)\b',
-            r'\b(it|that|this|these|those)\s+(one|place)?\b',
+            r'^\s*(it|that|this)\b',  # Just "it", "that", "this" at start
             
             # Selection phrases
             r'\b(which of|any of)\s+(these|those|them)\b',
             r'\b(pick|choose|select)\s+(the )?(first|second|one)\b',
             
             # Simple references
-            r'^\s*(first|second|last|it|that)\s*$',  # Just "first" or "it"
+            r'^\s*(first|second|last)\s*$',  # Just "first" or "second"
             r'^\s*(tell me|more|details)\s+(about )?(first|second|it|that)\s*$',
         ]
         
@@ -167,9 +417,8 @@ class HybridNLPEngine:
         
         return False
 
-
-    def _extract_entities_spacy(self, message: str) -> Dict[str, Any]:
-        """Extract entities using spaCy"""
+    def _extract_entities_spacy(self, message: str, session_context: Dict = None) -> Dict[str, Any]:
+        """Extract entities using spaCy with improved location detection"""
         if not self.nlp:
             return self._fallback_entity_extraction(message)
         
@@ -182,8 +431,8 @@ class HybridNLPEngine:
             'money': [],
             'durations': [],
             'activities': [],
-            'primary_activity': None,  # NEW: The main activity user is asking for
-            'filter_mode': 'strict',    # NEW: strict or relaxed filtering
+            'primary_activity': None,
+            'filter_mode': 'strict',
             'person_count': None
         }
         
@@ -196,7 +445,8 @@ class HybridNLPEngine:
             elif ent.label_ == 'DATE':
                 entities['dates'].append(ent.text)
             elif ent.label_ == 'CARDINAL':
-                entities['numbers'].append(int(ent.text) if ent.text.isdigit() else ent.text)
+                if ent.text.isdigit():
+                    entities['numbers'].append(int(ent.text))
         
         # Extract budget (rupees)
         budget_match = re.search(r'(\d+)k?\s*(budget|rupees|rs|inr)?', message.lower())
@@ -211,10 +461,10 @@ class HybridNLPEngine:
         if duration_match:
             entities['durations'].append(int(duration_match.group(1)))
         
-        # NEW: Improved activity extraction with PRIMARY activity detection
+        # Activity extraction (same as before)
         activity_keywords = {
             'beach': ['beach', 'beaches', 'sea', 'ocean', 'coastal', 'seaside'],
-            'mountain': ['mountain', 'mountains', 'hill', 'hills', 'peak', 'trekking', 'hiking','hilly'],
+            'mountain': ['mountain', 'mountains', 'hill', 'hills', 'peak', 'trekking', 'hiking', 'hilly'],
             'adventure': ['adventure', 'adventurous', 'rafting', 'paragliding', 'bungee'],
             'cultural': ['cultural', 'heritage', 'temple', 'temples', 'monument', 'monuments', 'historical', 'fort', 'forts'],
             'wildlife': ['wildlife', 'safari', 'animals', 'jungle', 'forest', 'national park'],
@@ -228,474 +478,254 @@ class HybridNLPEngine:
         message_lower = message.lower()
         matched_activities = []
         
-        # Check each activity and record matches
         for activity, keywords in activity_keywords.items():
             for keyword in keywords:
-                # Use word boundaries for better matching
                 if re.search(r'\b' + re.escape(keyword) + r'\b', message_lower):
                     matched_activities.append(activity)
-                    break  # Don't add same activity multiple times
+                    break
         
-        # Determine PRIMARY activity based on explicit mentions
-        # Priority: If user says "show me beach destinations", "beach" is primary
-        primary_activity_patterns = [
-            (r'\b(show|find|search|looking for|want|suggest|recommend)\s+\w*\s*(beach|beaches)\s+(destination|place)', 'beach'),
-            (r'\b(show|find|search|looking for|want|suggest|recommend)\s+\w*\s*(mountain|mountains|hill)\s+(destination|place)', 'mountain'),
-            (r'\b(show|find|search|looking for|want|suggest|recommend)\s+\w*\s*(adventure|adventurous)\s+(destination|place)', 'adventure'),
-            (r'\b(show|find|search|looking for|want|suggest|recommend)\s+\w*\s*(cultural|heritage)\s+(destination|place)', 'cultural'),
-            (r'\b(show|find|search|looking for|want|suggest|recommend)\s+\w*\s*(wildlife|safari)\s+(destination|place)', 'wildlife'),
-            (r'\b(show|find|search|looking for|want|suggest|recommend)\s+\w*\s*(spiritual|religious|pilgrimage)\s+(destination|place)', 'spiritual'),
-            
-            # Direct mentions
-            (r'\b(beach|beaches)\s+(destination|place|location)', 'beach'),
-            (r'\b(mountain|mountains)\s+(destination|place|location)', 'mountain'),
-            (r'\b(adventure)\s+(destination|place|location)', 'adventure'),
-            (r'\b(cultural|heritage)\s+(destination|place|location)', 'cultural'),
-            (r'\b(waterfall|waterfalls)\s+(destination|place|location)', 'waterfall'),
-        ]
-        
-        primary_detected = False
-        for pattern, activity in primary_activity_patterns:
-            if re.search(pattern, message_lower):
-                entities['primary_activity'] = activity
-                entities['filter_mode'] = 'strict'  # Use strict filtering
-                primary_detected = True
-                break
-        
-        # If no primary activity detected but activities were found
-        if not primary_detected and matched_activities:
-            # If only one activity matched, make it primary
-            if len(matched_activities) == 1:
-                entities['primary_activity'] = matched_activities[0]
-                entities['filter_mode'] = 'strict'
-            # If multiple activities, use relaxed mode
-            else:
-                entities['filter_mode'] = 'relaxed'
-        
-        # Set all matched activities
-        entities['activities'] = list(set(matched_activities))  # Remove duplicates
+        entities['activities'] = list(set(matched_activities))
         
         # Extract person count
         person_patterns = [
-            r'(\d+)\s*(people|person|pax)',
-            r'(solo|alone|myself)',
-            r'(couple|two|2)',
-            r'(family|group)'
+            (r'(\d+)\s*(people|person|pax)', lambda m: int(m.group(1))),
+            (r'(solo|alone|myself)', lambda m: 1),
+            (r'(couple|two|2)', lambda m: 2),
+            (r'(family|group)', lambda m: 4)
         ]
         
-        for pattern in person_patterns:
+        for pattern, extractor in person_patterns:
             match = re.search(pattern, message_lower)
             if match:
-                if 'solo' in match.group(0) or 'alone' in match.group(0):
-                    entities['person_count'] = 1
-                elif 'couple' in match.group(0) or 'two' in match.group(0):
-                    entities['person_count'] = 2
-                elif 'family' in match.group(0):
-                    entities['person_count'] = 4
-                elif match.group(1).isdigit():
-                    entities['person_count'] = int(match.group(1))
+                entities['person_count'] = extractor(match)
                 break
         
         return entities
     
-    def _fallback_intent_classification(self, message: str, entities: Dict) -> Dict[str, Any]:
-        """Fallback when Gemini unavailable - use rule-based classification"""
-        message_lower = message.lower()
+    def _fallback_entity_extraction(self, message: str) -> Dict[str, Any]:
+        """Fallback entity extraction when spaCy unavailable"""
+        entities = {
+            'locations': [],
+            'activities': [],
+            'budget': None,
+            'durations': [],
+            'person_count': None
+        }
         
-        # Rule-based intent detection
+        # Simple regex-based extraction
+        budget_match = re.search(r'(\d+)k?', message.lower())
+        if budget_match:
+            amount = int(budget_match.group(1))
+            if amount < 1000:
+                amount *= 1000
+            entities['budget'] = {'amount': amount}
+        
+        return entities
+    
+    def _analyze_with_gemini(self, message: str, entities: Dict, context: Dict = None) -> Dict[str, Any]:
+        """
+        Use Gemini with ROBUST error handling and JSON parsing
+        """
+        if not self.gemini_model:
+            logger.info("Gemini unavailable, using fallback classification")
+            return self._fallback_intent_classification(message, entities)
+        
+        try:
+            # Build prompt
+            prompt = self._build_gemini_prompt(message, entities, context)
+            
+            # Call Gemini API with timeout
+            response = self.gemini_model.generate_content(
+                prompt,
+                request_options={'timeout': 10}  # 10 second timeout
+            )
+            
+            if not response or not hasattr(response, 'text'):
+                logger.warning("Gemini returned empty response")
+                return self._fallback_intent_classification(message, entities)
+            
+            result_text = response.text.strip()
+            
+            # Try to parse JSON
+            result = self._parse_gemini_response(result_text)
+            result['source'] = 'gemini'
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Gemini API error: {str(e)}")
+            return self._fallback_intent_classification(message, entities)
+    
+    def _parse_gemini_response(self, text: str) -> Dict[str, Any]:
+        """
+        ROBUST JSON parsing with multiple fallback strategies
+        """
+        # Strategy 1: Direct JSON parse
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        
+        # Strategy 2: Extract JSON from markdown code blocks
+        json_match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except json.JSONDecodeError:
+                pass
+        
+        # Strategy 3: Extract any JSON object from text
+        json_match = re.search(r'\{[^{}]*"intent"[^{}]*\}', text, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(0))
+            except json.JSONDecodeError:
+                pass
+        
+        # Strategy 4: Manual parsing from text
+        logger.warning(f"⚠️ Gemini didn't return valid JSON, parsing manually from: {text[:200]}")
+        return self._manual_parse_gemini_text(text)
+    
+    def _manual_parse_gemini_text(self, text: str) -> Dict[str, Any]:
+        """
+        Manually extract intent and other fields from Gemini's text response
+        """
+        text_lower = text.lower()
+        
+        # Extract intent
         intent = 'general'
+        intent_match = re.search(r'"intent":\s*"([^"]+)"', text)
+        if intent_match:
+            intent = intent_match.group(1)
+        else:
+            # Fallback: look for intent keywords in text
+            intent_keywords = {
+                'inappropriate': ['inappropriate', 'unsafe', 'vulgar'],
+                'search': ['search', 'looking for', 'find destinations'],
+                'attractions': ['attractions', 'things to do'],
+                'restaurants': ['restaurants', 'food', 'dining'],
+                'accommodations': ['accommodation', 'hotels', 'stay'],
+                'weather': ['weather', 'climate'],
+                'budget': ['budget', 'cost'],
+                'greeting': ['greeting', 'hello']
+            }
+            
+            for intent_type, keywords in intent_keywords.items():
+                if any(kw in text_lower for kw in keywords):
+                    intent = intent_type
+                    break
+        
+        # Extract confidence
         confidence = 0.6
+        conf_match = re.search(r'"confidence":\s*([0-9.]+)', text)
+        if conf_match:
+            confidence = float(conf_match.group(1))
         
-        # REFERENCE - Check FIRST
-        if self._is_reference_query(message):
-            intent = 'reference'
-            confidence = 0.95
-        
-        # GREETING - Must be at START of message or standalone
-        elif any(message_lower.strip().startswith(word) or message_lower.strip() == word 
-                for word in ['hi', 'hello', 'hey', 'namaste', 'good morning', 'good evening']):
-            intent = 'greeting'
-            confidence = 0.9
-        
-        # FAREWELL
-        elif any(word in message_lower for word in ['bye', 'goodbye', 'later', 'see you']):
-            intent = 'farewell'
-            confidence = 0.9
-        
-        # DURATION (before SEARCH to prioritize constraint)
-        elif (('days' in message_lower or 'for ' in message_lower) and 
-            entities.get('durations') and 
-            not any(word in message_lower for word in ['show', 'find', 'search'])):
-            intent = 'duration'
-            confidence = 0.85
-        
-        # BUDGET (before SEARCH to prioritize constraint)
-        elif (('budget' in message_lower or 'under' in message_lower or 'within' in message_lower) and 
-            (entities.get('budget') or re.search(r'\d+k?\s*(rupees|rs)?', message_lower))):
-            intent = 'budget'
-            confidence = 0.85
-        
-        # SEARCH - Must have search indicators + activities/locations
-        elif (any(word in message_lower for word in ['show', 'find', 'search', 'looking for', 'give me', 'suggest']) and
-            (entities.get('activities') or entities.get('locations') or 
-            any(word in message_lower for word in ['destination', 'place', 'beach', 'mountain', 'hill']))):
-            intent = 'search'
-            confidence = 0.8
-        
-        # WEATHER
-        elif any(word in message_lower for word in ['weather', 'temperature', 'climate', 'forecast']):
-            intent = 'weather'
-            confidence = 0.8
-        
-        # RECOMMENDATION
-        elif any(word in message_lower for word in ['recommend', 'suggest']) and 'for me' in message_lower:
-            intent = 'recommendation'
-            confidence = 0.8
-        
-        # Basic safety check
-        profanity_list = ['fuck', 'shit', 'damn', 'bitch', 'ass', 'bastard']
-        is_safe = not any(word in message_lower for word in profanity_list)
+        # Extract safety
+        is_safe = 'unsafe' not in text_lower and 'inappropriate' not in text_lower
         
         return {
             'intent': intent,
             'confidence': confidence,
             'is_safe': is_safe,
-            'safety_issues': [] if is_safe else ['vulgar'],
-            'context_understanding': f"Fallback detected as {intent} query",
+            'safety_issues': [] if is_safe else ['content_violation'],
+            'context_understanding': text[:150],
             'suggested_response_type': 'informative' if is_safe else 'firm_decline'
         }
     
-    def _analyze_with_gemini(self, message: str, entities: Dict, context: Dict = None) -> Dict[str, Any]:
-        """
-        Use Gemini to:
-        1. Classify intent with high accuracy
-        2. Check content safety
-        3. Understand context and nuance
-        """
-        if not self.gemini_model:
-            return self._fallback_intent_classification(message, entities)
-        
-        try:
-            # Build prompt for Gemini
-            prompt = self._build_gemini_prompt(message, entities, context)
-            
-            # Call Gemini API
-            response = self.gemini_model.generate_content(prompt)
-            result_text = response.text.strip()
-            
-            # Parse JSON response
-            try:
-                result = json.loads(result_text)
-            except json.JSONDecodeError:
-                # Fallback if not JSON
-                logger.warning("Gemini didn't return JSON, parsing manually")
-                result = self._parse_gemini_text_response(result_text)
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Gemini API error: {e}")
-            return self._fallback_intent_classification(message, entities)
-    
     def _build_gemini_prompt(self, message: str, entities: Dict, context: Dict = None) -> str:
-        """
-        Build structured prompt for Gemini with comprehensive intent detection
-        Includes: attractions, restaurants, accommodations, and all other intents
-        """
+        """Build structured prompt for Gemini"""
         
         context_info = ""
         if context:
             current_destinations = context.get('current_destinations', [])
-            mentioned_destinations = context.get('mentioned_destinations', [])
+            last_location = context.get('last_discussed_location')
             
             context_info = f"""
-    Previous conversation context:
-    - Current topic: {context.get('current_topic', 'None')}
-    - Active search results: {len(current_destinations)} destinations shown
-    - User was viewing: {len(current_destinations)} destinations
-    - Recently discussed: {', '.join(mentioned_destinations[:3]) if mentioned_destinations else 'None'}
-    - Last intent: {context.get('last_intent', 'None')}
-    """
+Previous conversation context:
+- Last discussed location: {last_location.get('name') if last_location else 'None'}
+- Current search results: {len(current_destinations)} destinations shown
+- Last intent: {context.get('last_intent', 'None')}
+"""
         
-        prompt = f"""You are an AI assistant for a travel planning chatbot. Analyze this user message and return a JSON response.
+        prompt = f"""You are an AI assistant for a travel planning chatbot. Analyze this user message and return ONLY a valid JSON object.
 
-    User message: "{message}"
+User message: "{message}"
+Extracted entities: {json.dumps(entities)}
+{context_info}
 
-    Extracted entities: {json.dumps(entities)}
+CRITICAL RULES:
+1. Return ONLY valid JSON, no other text
+2. No markdown, no code blocks, just pure JSON
+3. Intent priority: reference > location-specific > constraints > search > general
 
-    {context_info}
+Available intents:
+- reference: User referring to previous results ("the first one", "tell me about it")
+- attractions: Things to do, places to visit
+- restaurants: Where to eat, food places
+- accommodations: Hotels, where to stay
+- weather: Weather/climate queries
+- safety: Safety concerns
+- search: Looking for NEW destinations
+- duration: Just mentioning duration constraint
+- budget: Just mentioning budget constraint
+- greeting: Hi, hello
+- farewell: Bye, thanks
+- general: Everything else
 
-    CRITICAL INTENT DETECTION RULES (Priority Order):
-
-    **TIER 1 - Reference & Conversation Flow:**
-    1. "reference" = User referring to previous results (e.g., "the first one", "tell me about it", "that place", "show it")
-
-    **TIER 2 - Progressive Filtering (when results exist):**
-    2. "duration" = ONLY duration mentioned WITHOUT search words (e.g., "for 5 days", "7 days")
-    3. "budget" = ONLY budget mentioned WITHOUT search words (e.g., "under 30k", "within budget")
-
-    **TIER 3 - Destination-Specific Queries:**
-    4. "attractions" = Things to do, places to visit, activities (e.g., "What can I do in Goa?", "Things to do", "Places to visit in Manali", "activities in Delhi")
-    5. "restaurants" = Food, dining, where to eat (e.g., "Where to eat in Goa?", "Best restaurants", "food places", "good restaurants in Mumbai")
-    6. "accommodations" = Hotels, stay, lodging (e.g., "Where to stay?", "Hotels in Manali", "Best places to stay", "accommodation in Jaipur")
-    7. "weather" = Climate, temperature, forecast (e.g., "What's the weather?", "Will it rain?")
-    8. "safety" = Safety concerns, is it safe (e.g., "Is Goa safe?", "Safety in Delhi")
-
-    **TIER 4 - Search & Discovery:**
-    9. "search" = Looking for NEW destinations (e.g., "show me beach places", "find mountain destinations")
-    10. "recommendation" = Personalized suggestions (e.g., "recommend destinations for me", "suggest places")
-
-    **TIER 5 - Planning & Logistics:**
-    11. "trip_planning" = Itinerary, planning (e.g., "Plan a trip to Goa", "Create itinerary")
-    12. "bookmark" = Save, wishlist (e.g., "Save this destination", "Add to wishlist")
-    13. "more_info" = General destination information (e.g., "Tell me about Goa", "More about Kashmir")
-
-    **TIER 6 - Conversation:**
-    14. "greeting" = Hi, hello, hey
-    15. "farewell" = Bye, goodbye, thanks
-
-    **TIER 7 - Safety:**
-    16. "inappropriate" = Unsafe, vulgar, harmful content
-
-    CRITICAL DISTINCTION EXAMPLES:
-    ✓ "Tell me about the first one" → reference (referring to previous result)
-    ✓ "For 5 days" → duration (just constraint, no search)
-    ✓ "Under 30k budget" → budget (just constraint, no search)
-    ✓ "Show me beach destinations" → search (new search)
-    ✓ "For 5 days beach trip" → search (has search intent, not just constraint)
-    ✓ "What can I do in Goa?" → attractions (asking about activities)
-    ✓ "Where to eat in Manali?" → restaurants (asking about food)
-    ✓ "Hotels in Jaipur" → accommodations (asking about stay)
-    ✓ "Tell me about Goa" → more_info (general information, no specific category)
-
-    **Location Detection:**
-    - If message contains a specific location + activity question → Use specific intent
-    - "Things to do in Goa" → attractions
-    - "Restaurants in Mumbai" → restaurants
-    - "Hotels in Delhi" → accommodations
-    - If message is just "Tell me about [Place]" → more_info
-
-    Return ONLY valid JSON in this exact format:
-    {{
-    "intent": "reference|duration|budget|attractions|restaurants|accommodations|weather|safety|search|recommendation|trip_planning|bookmark|more_info|greeting|farewell|inappropriate|general",
-    "confidence": 0.95,
-    "is_safe": true,
-    "safety_issues": [],
-    "context_understanding": "Brief explanation of what user wants",
-    "suggested_response_type": "informative",
-    "reasoning": "Why you chose this intent (1-2 sentences)"
-    }}
-
-    **Content Safety Guidelines:**
-    - Mark as "inappropriate" if: profanity, hate speech, sexual content, violence, illegal activities
-    - Safety issues can be: "vulgar", "religious_extreme", "harmful", "spam", "offensive"
-    - Set is_safe to false if ANY safety issue detected
-
-    **Intent Priority (Check in this order):**
-    1. Reference → Duration/Budget → Attractions/Restaurants/Accommodations
-    2. Weather/Safety → Search/Recommendation
-    3. Trip Planning/Bookmark/More Info → Greeting/Farewell
-    4. General (fallback)
-
-    Response MUST be valid JSON only, no other text."""
+Return this EXACT format:
+{{"intent":"search","confidence":0.9,"is_safe":true,"safety_issues":[],"context_understanding":"Brief explanation","suggested_response_type":"informative"}}"""
 
         return prompt
     
-    def _parse_gemini_text_response(self, text: str) -> Dict[str, Any]:
-        """Parse non-JSON Gemini response"""
-        # Fallback parser
-        result = {
-            'intent': 'general',
-            'confidence': 0.5,
-            'is_safe': True,
-            'safety_issues': [],
-            'context_understanding': text[:100],
-            'suggested_response_type': 'informative'
-        }
-        
-        # Try to extract intent from text
-        text_lower = text.lower()
-        if 'inappropriate' in text_lower or 'unsafe' in text_lower:
-            result['intent'] = 'inappropriate'
-            result['is_safe'] = False
-            result['safety_issues'] = ['content_violation']
-        elif 'search' in text_lower or 'destination' in text_lower:
-            result['intent'] = 'search'
-        elif 'budget' in text_lower:
-            result['intent'] = 'budget'
-        
-        return result
-    
     def _fallback_intent_classification(self, message: str, entities: Dict) -> Dict[str, Any]:
         """
-        Fallback when Gemini unavailable - comprehensive rule-based classification
-        Includes all intents with proper priority ordering
+        Comprehensive fallback when Gemini unavailable
         """
         message_lower = message.lower().strip()
         
         intent = 'general'
         confidence = 0.6
         
-        # ============================================================
-        # TIER 1: REFERENCE (if context exists, check in calling function)
-        # ============================================================
+        # Reference check
         if self._is_reference_query(message):
             intent = 'reference'
             confidence = 0.95
         
-        # ============================================================
-        # TIER 2: CONVERSATION FLOW
-        # ============================================================
-        # GREETING - Must be at START of message
+        # Greeting
         elif any(message_lower.startswith(word) or message_lower == word 
-                for word in ['hi', 'hello', 'hey', 'namaste', 'good morning', 'good evening', 'greetings']):
+                for word in ['hi', 'hello', 'hey', 'namaste']):
             intent = 'greeting'
             confidence = 0.95
         
-        # FAREWELL
-        elif any(word in message_lower for word in ['bye', 'goodbye', 'see you later', 'thanks', 'thank you']):
-            intent = 'farewell'
-            confidence = 0.9
-        
-        # ============================================================
-        # TIER 3: DESTINATION-SPECIFIC QUERIES (High Priority)
-        # ============================================================
-        
-        # ATTRACTIONS - Things to do, places to visit
+        # Attractions
         elif any(phrase in message_lower for phrase in [
-            'things to do', 'what can i do', 'what to do', 'what should i do',
-            'places to visit', 'places to see', 'what to see', 'places to go',
-            'activities', 'attractions', 'sightseeing', 'tourist places',
-            'visit in', 'see in', 'do in', 'explore in',
-            'famous places', 'must visit', 'top attractions'
+            'things to do', 'what to do', 'places to visit', 'activities', 'attractions'
         ]):
             intent = 'attractions'
             confidence = 0.9
         
-        # RESTAURANTS - Where to eat, food places
+        # Restaurants
         elif any(phrase in message_lower for phrase in [
-            'where to eat', 'where can i eat', 'where should i eat',
-            'restaurants', 'restaurant in', 'food', 'dining',
-            'best food', 'eat in', 'cuisine', 'places to eat',
-            'good food', 'food places', 'cafes', 'cafe in',
-            'local food', 'street food', 'famous food'
+            'restaurant', 'where to eat', 'food', 'dining', 'eat in'
         ]):
             intent = 'restaurants'
             confidence = 0.9
         
-        # ACCOMMODATIONS - Where to stay, hotels
+        # Accommodations
         elif any(phrase in message_lower for phrase in [
-            'where to stay', 'where can i stay', 'where should i stay',
-            'hotels', 'hotel in', 'accommodation', 'accommodations',
-            'lodging', 'stay in', 'places to stay',
-            'guest house', 'guesthouse', 'resort', 'resorts',
-            'hostel', 'hostels', 'booking', 'best hotels'
+            'hotel', 'where to stay', 'accommodation', 'stay in', 'lodging'
         ]):
             intent = 'accommodations'
             confidence = 0.9
         
-        # ============================================================
-        # TIER 4: PROGRESSIVE FILTERING (When adding constraints)
-        # ============================================================
-        
-        # DURATION (before SEARCH to prioritize constraint)
-        elif (('days' in message_lower or 'for ' in message_lower or 'day' in message_lower) and 
-            entities.get('durations') and 
-            not any(word in message_lower for word in ['show', 'find', 'search', 'looking for'])):
-            intent = 'duration'
-            confidence = 0.85
-        
-        # BUDGET (before SEARCH to prioritize constraint)
-        elif (('budget' in message_lower or 'under' in message_lower or 'within' in message_lower or 
-            'cheap' in message_lower or 'affordable' in message_lower) and 
-            (entities.get('budget') or re.search(r'\d+k?\s*(rupees|rs|inr)?', message_lower)) and
-            not any(word in message_lower for word in ['show', 'find', 'search'])):
-            intent = 'budget'
-            confidence = 0.85
-        
-        # ============================================================
-        # TIER 5: SEARCH & DISCOVERY
-        # ============================================================
-        
-        # SEARCH - Must have search indicators + activities/locations
-        elif (any(word in message_lower for word in [
-            'show', 'find', 'search', 'looking for', 'give me', 'suggest', 'list'
-        ]) and (
-            entities.get('activities') or 
-            entities.get('locations') or 
-            any(word in message_lower for word in [
-                'destination', 'destinations', 'place', 'places',
-                'beach', 'beaches', 'mountain', 'mountains', 'hill', 'hills'
-            ])
-        )):
+        # Search
+        elif any(word in message_lower for word in ['show', 'find', 'search', 'looking for']):
             intent = 'search'
             confidence = 0.85
         
-        # RECOMMENDATION
-        elif any(phrase in message_lower for phrase in [
-            'recommend', 'recommendations', 'suggest', 'suggestions',
-            'what do you recommend', 'what would you suggest'
-        ]) and any(word in message_lower for word in ['for me', 'me some', 'to me']):
-            intent = 'recommendation'
-            confidence = 0.85
-        
-        # ============================================================
-        # TIER 6: INFORMATION & QUERIES
-        # ============================================================
-        
-        # WEATHER
-        elif any(word in message_lower for word in [
-            'weather', 'temperature', 'climate', 'forecast',
-            'rain', 'sunny', 'cold', 'hot', 'warm'
-        ]):
-            intent = 'weather'
-            confidence = 0.85
-        
-        # SAFETY
-        elif any(phrase in message_lower for phrase in [
-            'is it safe', 'safe to visit', 'safety', 'is safe',
-            'safe to travel', 'how safe'
-        ]):
-            intent = 'safety'
-            confidence = 0.85
-        
-        # MORE INFO (general information about a destination)
-        elif any(phrase in message_lower for phrase in [
-            'tell me about', 'tell me more about', 'more about',
-            'information about', 'details about', 'know about',
-            'what is', 'what\'s', 'describe'
-        ]) and not any(phrase in message_lower for phrase in [
-            'things to do', 'where to eat', 'where to stay'
-        ]):
-            intent = 'more_info'
-            confidence = 0.85
-        
-        # ============================================================
-        # TIER 7: PLANNING & ACTIONS
-        # ============================================================
-        
-        # TRIP PLANNING
-        elif any(phrase in message_lower for phrase in [
-            'plan a trip', 'plan my trip', 'create itinerary',
-            'itinerary', 'schedule', 'trip plan'
-        ]):
-            intent = 'trip_planning'
-            confidence = 0.85
-        
-        # BOOKMARK
-        elif any(phrase in message_lower for phrase in [
-            'save', 'bookmark', 'add to wishlist', 'wishlist',
-            'save this', 'remember this'
-        ]):
-            intent = 'bookmark'
-            confidence = 0.85
-        
-        # ============================================================
-        # TIER 8: SAFETY CHECK
-        # ============================================================
-        
-        # Basic profanity/safety check
-        profanity_list = ['fuck', 'shit', 'damn', 'bitch', 'ass', 'bastard', 'hell']
+        # Safety check
+        profanity_list = ['fuck', 'shit', 'damn', 'bitch']
         is_safe = not any(word in message_lower for word in profanity_list)
         
         if not is_safe:
@@ -707,19 +737,19 @@ class HybridNLPEngine:
             'confidence': confidence,
             'is_safe': is_safe,
             'safety_issues': [] if is_safe else ['vulgar'],
-            'context_understanding': f"Rule-based classification detected as {intent} query",
-            'suggested_response_type': 'informative' if is_safe else 'firm_decline'
+            'context_understanding': f"Fallback: detected as {intent}",
+            'suggested_response_type': 'informative' if is_safe else 'firm_decline',
+            'source': 'fallback'
         }
     
     def _check_learned_patterns(self, message: str) -> Optional[str]:
         """Check if message matches learned patterns"""
         message_lower = message.lower()
         
-        # Check phrase mappings
         phrase_mappings = self.learned_patterns.get('phrase_mappings', {})
         for known_phrase, intent in phrase_mappings.items():
             if self._fuzzy_match(message_lower, known_phrase, threshold=0.85):
-                logger.info(f"Matched learned pattern: {known_phrase} -> {intent}")
+                logger.info(f"✓ Matched learned pattern: {known_phrase} -> {intent}")
                 return intent
         
         return None
@@ -733,21 +763,16 @@ class HybridNLPEngine:
     def learn_from_interaction(self, message: str, detected_intent: str, 
                                user_feedback: Optional[str] = None, 
                                correct_intent: Optional[str] = None):
-        """
-        Learning mechanism: Update patterns based on user interactions
-        """
+        """Learning mechanism: Update patterns based on user interactions"""
         message_clean = message.lower().strip()
         
-        # If user provided correction
         if correct_intent and correct_intent != detected_intent:
-            logger.info(f"Learning: '{message_clean}' -> {correct_intent} (was {detected_intent})")
+            logger.info(f"📚 Learning: '{message_clean}' -> {correct_intent} (was {detected_intent})")
             
-            # Add to phrase mappings
             phrase_mappings = self.learned_patterns.get('phrase_mappings', {})
             phrase_mappings[message_clean] = correct_intent
             self.learned_patterns['phrase_mappings'] = phrase_mappings
             
-            # Add to correction history
             correction_history = self.learned_patterns.get('correction_history', [])
             correction_history.append({
                 'message': message_clean,
@@ -755,33 +780,23 @@ class HybridNLPEngine:
                 'correct_intent': correct_intent,
                 'timestamp': datetime.now().isoformat()
             })
-            self.learned_patterns['correction_history'] = correction_history[-100:]  # Keep last 100
+            self.learned_patterns['correction_history'] = correction_history[-100:]
             
-            # Save patterns
             self._save_learned_patterns()
-        
-        # If positive feedback (implicit learning)
-        elif user_feedback == 'positive':
-            # Reinforce current pattern
-            phrase_mappings = self.learned_patterns.get('phrase_mappings', {})
-            phrase_mappings[message_clean] = detected_intent
-            self.learned_patterns['phrase_mappings'] = phrase_mappings
-            self._save_learned_patterns()
-    
-    def _check_cache(self, message: str) -> Optional[Dict]:
+
+
+    def _check_cache(self, message: str, context_key: str = "") -> Optional[Dict]:
         """Check if similar query was processed recently"""
-        cache_key = f"nlp_cache:{hash(message.lower())}"
+        cache_key = f"nlp_cache:{hash(message.lower() + context_key)}"
         return cache.get(cache_key)
     
-    def _cache_result(self, message: str, result: Dict):
-        """Cache processing result for 1 hour"""
-        cache_key = f"nlp_cache:{hash(message.lower())}"
-        cache.set(cache_key, result, timeout=3600)
+    def _cache_result(self, message: str, result: Dict, context_key: str = ""):
+        """Cache processing result for 30 minutes"""
+        cache_key = f"nlp_cache:{hash(message.lower() + context_key)}"
+        cache.set(cache_key, result, timeout=1800)
     
     def handle_inappropriate_content(self, message: str, safety_issues: List[str]) -> Dict[str, str]:
-        """
-        Generate appropriate response for inappropriate content
-        """
+        """Generate appropriate response for inappropriate content"""
         if 'vulgar' in safety_issues:
             return {
                 'message': "I noticed some inappropriate language. Let's keep our conversation respectful! 😊\n\n"
@@ -792,7 +807,7 @@ class HybridNLPEngine:
         elif 'religious_extreme' in safety_issues:
             return {
                 'message': "I'm here to help you discover amazing travel destinations! 🌍\n\n"
-                          "I focus on travel planning and can't engage in religious discussions. "
+                        "I focus on travel planning and can't engage in religious discussions. "
                           "What kind of places would you like to explore?",
                 'tone': 'firm_redirect'
             }
@@ -817,6 +832,7 @@ class HybridNLPEngine:
                           "What kind of destinations interest you?",
                 'tone': 'gentle_redirect'
             }
+    
 
 
 # Singleton instance

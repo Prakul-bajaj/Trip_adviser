@@ -134,6 +134,64 @@ def chat(request):
         entities = nlp_result['entities']
         
         # Route to appropriate handler
+
+        if nlp_result['intent'] == 'more_info':
+            location_ctx = nlp_result.get('location_context')
+        
+        if location_ctx:
+            location_name = location_ctx.get('name')
+            
+            logger.info(f"📍 MORE_INFO for: {location_name}")
+            
+            try:
+                # Get the destination
+                destination = Destination.objects.get(name__iexact=location_name)
+                
+                # ✅ CRITICAL: Update location context
+                context_mgr.update_location_context(
+                    destination_id=str(destination.id),
+                    destination_name=destination.name,
+                    interaction_type='discussed'
+                )
+                
+                # Format detailed response about the destination
+                response_text = f"**{destination.name}, {destination.state}**\n\n"
+                response_text += f"{destination.description}\n\n"
+                
+                # Add key details
+                response_text += f"**Type:** {', '.join(destination.geography_types)}\n"
+                response_text += f"**Best Time:** {', '.join(destination.best_time_to_visit)}\n"
+                response_text += f"**Budget:** ₹{destination.budget_range_min:,} - ₹{destination.budget_range_max:,}\n"
+                response_text += f"**Duration:** {destination.typical_duration} days\n\n"
+                
+                if destination.highlights:
+                    response_text += f"**Highlights:**\n{destination.highlights}\n\n"
+                
+                # Add quick reply buttons
+                quick_replies = [
+                    f"Things to do in {destination.name}",
+                    f"Where to eat in {destination.name}",
+                    f"Hotels in {destination.name}",
+                    f"Weather in {destination.name}"
+                ]
+                
+                logger.info(f"✓ Destination info sent for: {destination.name}")
+                
+            except Destination.DoesNotExist:
+                response_text = f"I don't have detailed information about {location_name} yet. Try asking about other destinations!"
+                logger.warning(f"Destination not found: {location_name}")
+            
+            except Destination.MultipleObjectsReturned:
+                # Handle if multiple destinations match
+                destinations = Destination.objects.filter(name__icontains=location_name)[:3]
+                response_text = f"I found multiple places matching '{location_name}':\n\n"
+                for i, d in enumerate(destinations, 1):
+                    response_text += f"{i}. {d.name}, {d.state}\n"
+                response_text += "\nWhich one would you like to know about?"
+        
+        else:
+            response_text = "Which destination would you like to know about?"
+
         if detected_intent == 'greeting':
             bot_response = handle_greeting(request, session)
         
@@ -975,11 +1033,12 @@ def feedback(request):
 
 # Class-based views remain unchanged
 class ChatSessionListCreateView(generics.ListCreateAPIView):
+    """List and create chat sessions"""
     serializer_class = ChatSessionSerializer
     permission_classes = [IsAuthenticated]
     
     def get_queryset(self):
-        return ChatSession.objects.filter(user=self.request.user)
+        return ChatSession.objects.filter(user=self.request.user).order_by('-started_at')
     
     def perform_create(self, serializer):
         serializer.save(user=self.request.user)
@@ -993,7 +1052,10 @@ class ChatSessionDetailView(generics.RetrieveUpdateDestroyAPIView):
         return ChatSession.objects.filter(user=self.request.user)
 
 
-class MessageListView(generics.ListAPIView):
+# In chatbot/views.py - REPLACE the existing MessageListView class
+
+class MessageListView(generics.ListCreateAPIView):  # ← Changed from ListAPIView
+    """List messages AND send new messages"""
     serializer_class = MessageSerializer
     permission_classes = [IsAuthenticated]
     
@@ -1003,6 +1065,111 @@ class MessageListView(generics.ListAPIView):
             session_id=session_id,
             session__user=self.request.user
         ).order_by('timestamp')
+    
+    def create(self, request, *args, **kwargs):
+        """Handle POST requests to send messages"""
+        session_id = self.kwargs['session_id']
+        user_message = request.data.get('message') or request.data.get('content', '')
+        
+        if not user_message.strip():
+            return Response({'error': 'Message is required'}, status=400)
+        
+        try:
+            # Get session
+            session = ChatSession.objects.get(id=session_id, user=request.user)
+            
+            # Process through the main chat function logic
+            # Save user message
+            user_msg = Message.objects.create(
+                session=session,
+                sender='user',
+                content=user_message
+            )
+            
+            # Get NLP engine and process
+            nlp_engine = get_nlp_engine()
+            context_mgr = ConversationContextManager(session)
+            context_summary = context_mgr.get_context_summary()
+            
+            nlp_result = nlp_engine.process_message(
+                message=user_message,
+                user_id=str(request.user.id),
+                session_context=context_summary
+            )
+            
+            # Handle unsafe content
+            if not nlp_result['is_safe']:
+                safety_response = nlp_engine.handle_inappropriate_content(
+                    user_message, nlp_result['safety_issues']
+                )
+                bot_msg = Message.objects.create(
+                    session=session, sender='bot', content=safety_response['message']
+                )
+                return Response({
+                    'message': safety_response['message'],
+                    'response': safety_response['message'],  # ← Add this alias
+                    'session_id': str(session.id),
+                    'is_safe': False
+                })
+            
+            # Route to handlers based on intent
+            detected_intent = nlp_result['intent']
+            entities = nlp_result['entities']
+            
+            # Intent routing
+            if detected_intent == 'greeting':
+                bot_response = handle_greeting(request, session)
+            elif detected_intent == 'farewell':
+                bot_response = handle_farewell(request, session)
+            elif detected_intent == 'weather':
+                bot_response = handle_weather_query(request, session, user_message, entities)
+            elif detected_intent == 'recommendation':
+                bot_response = handle_personalized_recommendations(request, session, user_message, entities)
+            elif detected_intent == 'search':
+                bot_response = handle_destination_search_v2(request, session, user_message, entities)
+            elif detected_intent == 'trip_planning':
+                bot_response = handle_itinerary_creation(request, session, user_message, entities)
+            elif detected_intent == 'more_info':
+                bot_response = handle_more_info(request, session, user_message)
+            elif detected_intent == 'budget':
+                bot_response = handle_budget_query_v2(request, session, user_message, entities)
+            elif detected_intent == 'reference':
+                bot_response = handle_reference_query(request, session, user_message, entities)
+            elif detected_intent == 'attractions':
+                bot_response = handle_destination_specific_query(request, session, user_message, entities, 'attractions')
+            elif detected_intent == 'restaurants':
+                bot_response = handle_destination_specific_query(request, session, user_message, entities, 'restaurants')
+            elif detected_intent == 'accommodations':
+                bot_response = handle_destination_specific_query(request, session, user_message, entities, 'accommodations')
+            else:
+                bot_response = handle_general_query(request, session, user_message)
+            
+            # Save bot message
+            bot_msg = Message.objects.create(
+                session=session,
+                sender='bot',
+                content=bot_response['message']
+            )
+            
+            # Update session
+            session.total_messages += 2
+            session.save()
+            
+            # Add response alias for frontend compatibility
+            bot_response['response'] = bot_response['message']
+            bot_response['session_id'] = str(session.id)
+            
+            return Response(bot_response)
+            
+        except ChatSession.DoesNotExist:
+            return Response({'error': 'Session not found'}, status=404)
+        except Exception as e:
+            logger.error(f"Message send error: {e}", exc_info=True)
+            return Response({
+                'message': "Sorry, I encountered an error. Please try again.",
+                'response': "Sorry, I encountered an error. Please try again.",
+                'error': str(e)
+            }, status=500)
 
 
 # Remaining handler functions (simplified versions)
@@ -1699,6 +1866,37 @@ def handle_attractions_query(request, session, message, destination):
     Handle queries specifically about attractions/things to do
     Example: "What can I do in Goa?", "Show me attractions in Manali"
     """
+    if not destination:
+        destinations = Destination.objects.filter(is_active=True)
+        
+        # Try message first
+        for dest in destinations:
+            if dest.name.lower() in message.lower():
+                destination = dest
+                break
+        
+        # Try context
+        if not destination:
+            context_mgr = ConversationContextManager(session)
+            last_location = context_mgr.get_last_discussed_location()
+            
+            if last_location:
+                try:
+                    destination = Destination.objects.get(
+                        id=last_location['id'],
+                        is_active=True
+                    )
+                except Destination.DoesNotExist:
+                    pass
+    
+    if not destination:
+        return {
+            'message': "Which destination would you like to explore? 🎪",
+            'suggestions': ["Show me destinations", "Things to do in Goa"],
+            'context': 'need_destination_for_attractions'
+        }
+    
+    # Rest of the function stays the same...
     attractions = destination.destination_attractions.all().order_by('-rating')
     
     if not attractions.exists():
@@ -1769,6 +1967,35 @@ def handle_restaurants_query(request, session, message, destination):
     Handle queries about restaurants/food
     Example: "Where can I eat in Goa?", "Best restaurants in Manali"
     """
+    if not destination:
+        destinations = Destination.objects.filter(is_active=True)
+        
+        for dest in destinations:
+            if dest.name.lower() in message.lower():
+                destination = dest
+                break
+        
+        if not destination:
+            context_mgr = ConversationContextManager(session)
+            last_location = context_mgr.get_last_discussed_location()
+            
+            if last_location:
+                try:
+                    destination = Destination.objects.get(
+                        id=last_location['id'],
+                        is_active=True
+                    )
+                except Destination.DoesNotExist:
+                    pass
+    
+    if not destination:
+        return {
+            'message': "Which destination are you asking about? 🍽️",
+            'suggestions': ["Show destinations", "Restaurants in Goa"],
+            'context': 'need_destination_for_restaurants'
+        }
+    
+    # Rest stays the same...
     restaurants = destination.destination_restaurants.all().order_by('-rating')
     
     if not restaurants.exists():
@@ -1832,11 +2059,57 @@ def handle_restaurants_query(request, session, message, destination):
         'context': 'restaurants_shown'
     }
 
-def handle_accommodations_query(request, session, message, destination):
+def handle_accommodations_query(request, session, message, destination=None):
     """
     Handle queries about accommodations/hotels
     Example: "Where to stay in Goa?", "Hotels in Manali"
+    
+    Args:
+        destination: Destination object (can be None if not passed)
     """
+    from destinations.models import Destination
+    from .context_manager import ConversationContextManager
+    
+    # If destination not provided, try to find it
+    if not destination:
+        destinations = Destination.objects.filter(is_active=True)
+        
+        # Try to find from message
+        for dest in destinations:
+            if dest.name.lower() in message.lower():
+                destination = dest
+                break
+        
+        # If still not found, check context
+        if not destination:
+            context_mgr = ConversationContextManager(session)
+            last_location = context_mgr.get_last_discussed_location()
+            
+            if last_location:
+                try:
+                    destination = Destination.objects.get(
+                        id=last_location['id'],
+                        is_active=True
+                    )
+                except Destination.DoesNotExist:
+                    pass
+    
+    # If we still don't have a destination, ask user
+    if not destination:
+        return {
+            'message': "Which destination are you asking about? 🏨\n\n"
+                      "Please tell me the place name, for example:\n"
+                      "• 'Hotels in Goa'\n"
+                      "• 'Where to stay in Manali'",
+            'suggestions': [
+                "Show me destinations first",
+                "Hotels in Goa",
+                "Where to stay in Manali"
+            ],
+            'context': 'need_destination_for_accommodations'
+        }
+    
+    # ✅ NOW we have the correct destination - proceed
     accommodations = destination.destination_accommodations.all().order_by('-rating')
     
     if not accommodations.exists():

@@ -1,3 +1,5 @@
+# chatbot/context_manager.py - UPDATED VERSION
+
 import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Any
@@ -9,8 +11,8 @@ logger = logging.getLogger(__name__)
 
 class ConversationContextManager:
     """
-    Advanced context manager for multi-turn conversations
-    Handles topic tracking, progressive filtering, and reference resolution
+    Enhanced context manager with LOCATION MEMORY
+    Tracks which locations user has mentioned/discussed for smart reference resolution
     """
     
     def __init__(self, session: ChatSession):
@@ -44,12 +46,18 @@ class ConversationContextManager:
                         'current_destinations': [],
                         'current_destination_ids': [],
                         'is_refining': False,
-                        'search_mode': 'fresh'  # 'fresh', 'refining', 'expanding'
+                        'search_mode': 'fresh'
                     },
                     'mentioned_entities': {
                         'destinations': [],
                         'last_discussed_destination': None,
-                        'references': {}  # Track what pronouns refer to
+                        'references': {}
+                    },
+                    # NEW: Location memory for smart reference resolution
+                    'location_memory': {
+                        'last_discussed_location': None,  # {id, name, timestamp}
+                        'location_history': [],  # List of all mentioned locations
+                        'location_context': {}  # Additional context per location
                     },
                     'user_preferences_learned': {},
                     'rankings_applied': {
@@ -67,18 +75,123 @@ class ConversationContextManager:
         )
         return context
     
+    def update_location_context(self, destination_id: str, destination_name: str, 
+                                 interaction_type: str = 'discussed'):
+        """
+        NEW: Track location mentions for smart reference resolution
+        
+        Args:
+            destination_id: The destination ID
+            destination_name: The destination name
+            interaction_type: 'discussed', 'searched', 'asked_about', 'selected'
+        """
+        context_data = self.context.context_data or {}
+        
+        if 'location_memory' not in context_data:
+            context_data['location_memory'] = {
+                'last_discussed_location': None,
+                'location_history': [],
+                'location_context': {}
+            }
+        
+        location_memory = context_data['location_memory']
+        
+        # Update last discussed location
+        location_memory['last_discussed_location'] = {
+            'id': destination_id,
+            'name': destination_name,
+            'timestamp': datetime.now().isoformat(),
+            'interaction_type': interaction_type
+        }
+        
+        # Add to history if not already present
+        location_entry = {
+            'id': destination_id,
+            'name': destination_name,
+            'timestamp': datetime.now().isoformat(),
+            'interaction_type': interaction_type
+        }
+        
+        # Check if already in history
+        existing = next(
+            (loc for loc in location_memory['location_history'] if loc['id'] == destination_id),
+            None
+        )
+        
+        if not existing:
+            location_memory['location_history'].append(location_entry)
+        else:
+            # Update timestamp and interaction type
+            existing['timestamp'] = datetime.now().isoformat()
+            existing['interaction_type'] = interaction_type
+        
+        # Keep only last 10 locations
+        location_memory['location_history'] = location_memory['location_history'][-10:]
+        
+        # Also update old mentioned_entities for backward compatibility
+        if 'mentioned_entities' not in context_data:
+            context_data['mentioned_entities'] = {}
+        
+        context_data['mentioned_entities']['last_discussed_destination'] = destination_id
+        context_data['mentioned_entities']['last_discussed_name'] = destination_name
+        
+        self.context.context_data = context_data
+        self.context.save()
+        
+        logger.info(f"✓ Location context updated: {destination_name} ({interaction_type})")
+    
+    def get_last_discussed_location(self) -> Optional[Dict]:
+        """
+        Get the last location user discussed
+        Returns: {id, name, timestamp, interaction_type} or None
+        """
+        context_data = self.context.context_data or {}
+        location_memory = context_data.get('location_memory', {})
+        return location_memory.get('last_discussed_location')
+    
+    def get_location_history(self, limit: int = 5) -> List[Dict]:
+        """
+        Get recent location history
+        Returns: List of {id, name, timestamp, interaction_type}
+        """
+        context_data = self.context.context_data or {}
+        location_memory = context_data.get('location_memory', {})
+        history = location_memory.get('location_history', [])
+        return history[-limit:] if history else []
+    
+    def was_location_discussed(self, location_name: str) -> bool:
+        """Check if a location was recently discussed"""
+        history = self.get_location_history(limit=10)
+        return any(
+            loc['name'].lower() == location_name.lower() 
+            for loc in history
+        )
+    
+    def get_context_for_nlp(self) -> Dict[str, Any]:
+        """
+        Get context dictionary for NLP engine
+        Includes location memory for smart reference resolution
+        """
+        context_data = self.context.context_data or {}
+        
+        return {
+            'current_topic': context_data.get('conversation_flow', {}).get('current_topic'),
+            'last_intent': self.context.last_intent,
+            'current_destinations': self.get_current_destinations(),
+            'mentioned_destinations': context_data.get('mentioned_entities', {}).get('destinations', []),
+            'last_discussed_location': self.get_last_discussed_location(),  # NEW
+            'location_history': self.get_location_history(),  # NEW
+            'is_refining': context_data.get('active_search', {}).get('is_refining', False),
+            'constraints_applied': context_data.get('active_search', {}).get('constraints_applied', []),
+        }
+    
     def detect_topic_change(self, user_message: str, new_entities: Dict) -> Dict[str, Any]:
-        """
-        Detect if user is changing topic or refining current search
-        Returns: {'action': 'clear'|'refine'|'fresh'|'confirm', 'confidence': float, 'new_topic': str}
-        """
+        """Detect if user is changing topic or refining current search"""
         context_data = self.context.context_data or {}
         current_topic = context_data.get('conversation_flow', {}).get('current_topic')
         
-        # Extract potential new topic from message
         new_topic = self._extract_topic_from_message(user_message, new_entities)
         
-        # If no current topic, it's a fresh start
         if not current_topic:
             return {
                 'action': 'fresh',
@@ -86,7 +199,7 @@ class ConversationContextManager:
                 'new_topic': new_topic
             }
         
-        # Check if user explicitly changing topic
+        # Check explicit change indicators
         change_indicators = [
             'actually', 'instead', 'rather', 'change my mind', 
             'forget that', 'never mind', 'let\'s try', 'how about',
@@ -96,7 +209,6 @@ class ConversationContextManager:
         message_lower = user_message.lower()
         explicit_change = any(indicator in message_lower for indicator in change_indicators)
         
-        # If topics are completely different
         topic_similarity = self._calculate_topic_similarity(current_topic, new_topic)
         
         if explicit_change and topic_similarity < 0.3:
@@ -107,7 +219,6 @@ class ConversationContextManager:
                 'reason': 'explicit_change'
             }
         
-        # Check if it's a refinement (adding constraints to existing search)
         if self._is_refinement_query(user_message, new_entities):
             return {
                 'action': 'refine',
@@ -116,7 +227,6 @@ class ConversationContextManager:
                 'constraint_added': self._extract_constraint_type(user_message, new_entities)
             }
         
-        # If completely new topic without explicit change - ask for confirmation
         if topic_similarity < 0.4 and new_topic:
             return {
                 'action': 'confirm',
@@ -126,7 +236,6 @@ class ConversationContextManager:
                 'message': f"You were asking about {current_topic}. Do you want to switch to {new_topic}?"
             }
         
-        # Continue with current topic
         return {
             'action': 'continue',
             'confidence': 0.8,
@@ -137,7 +246,6 @@ class ConversationContextManager:
         """Extract main topic from message"""
         message_lower = message.lower()
         
-        # Topic keywords mapping
         topic_keywords = {
             'beach': ['beach', 'coastal', 'sea', 'ocean', 'seaside'],
             'mountain': ['mountain', 'hill', 'peak', 'himalaya', 'altitude'],
@@ -149,16 +257,13 @@ class ConversationContextManager:
             'food': ['food', 'culinary', 'cuisine', 'restaurant']
         }
         
-        # Check activities from entities
         if entities.get('activities'):
             return entities['activities'][0]
         
-        # Check message for topic keywords
         for topic, keywords in topic_keywords.items():
             if any(keyword in message_lower for keyword in keywords):
                 return topic
         
-        # Check locations (specific destinations mentioned)
         if entities.get('locations'):
             return f"destination:{entities['locations'][0]}"
         
@@ -172,7 +277,6 @@ class ConversationContextManager:
         if topic1 == topic2:
             return 1.0
         
-        # Related topics have some similarity
         related_groups = [
             {'beach', 'coastal', 'island'},
             {'mountain', 'hill', 'trek', 'adventure'},
@@ -191,7 +295,7 @@ class ConversationContextManager:
         return 0.0
     
     def _is_refinement_query(self, message: str, entities: Dict) -> bool:
-        """Check if message is refining existing search vs new search"""
+        """Check if message is refining existing search"""
         refinement_indicators = [
             'my budget', 'under', 'within', 'only', 'just',
             'need', 'must', 'should', 'prefer', 'want',
@@ -199,18 +303,13 @@ class ConversationContextManager:
         ]
         
         message_lower = message.lower()
-        
-        # Has budget/duration/other constraints without new topic
         has_constraint = any(indicator in message_lower for indicator in refinement_indicators)
-        
-        # Check if entities contain constraints (budget, duration, etc.)
         has_constraint_entities = bool(
             entities.get('budget') or 
             entities.get('duration') or 
             entities.get('person_count')
         )
         
-        # Check if referring to previous results
         reference_words = ['these', 'those', 'them', 'which one', 'the first', 'any of']
         has_reference = any(ref in message_lower for ref in reference_words)
         
@@ -240,14 +339,12 @@ class ConversationContextManager:
         
         active_search = context_data['active_search']
         
-        # If fresh search
         if not active_search.get('initial_query'):
             active_search['initial_query'] = query
             active_search['is_refining'] = False
             active_search['search_mode'] = 'fresh'
             active_search['results_evolution'] = []
         
-        # Add to results evolution
         step = len(active_search.get('results_evolution', [])) + 1
         active_search['results_evolution'].append({
             'step': step,
@@ -256,11 +353,9 @@ class ConversationContextManager:
             'timestamp': datetime.now().isoformat()
         })
         
-        # Update current destinations
         active_search['current_destination_ids'] = results
         active_search['is_refining'] = constraint is not None
         
-        # Add constraint if provided
         if constraint:
             if 'constraints_applied' not in active_search:
                 active_search['constraints_applied'] = []
@@ -285,69 +380,38 @@ class ConversationContextManager:
         Returns: destination_id or None
         """
         message_lower = message.lower()
-        context_data = self.context.context_data or {}
-        
-        # Get current destinations
         current_dest_ids = self.get_current_destinations()
         
         if not current_dest_ids:
             return None
         
-        # "the first one", "first", "1st"
         if any(word in message_lower for word in ['first', '1st', 'top']):
             return current_dest_ids[0] if current_dest_ids else None
         
-        # "the second one", "2nd"
         if any(word in message_lower for word in ['second', '2nd']):
             return current_dest_ids[1] if len(current_dest_ids) > 1 else None
         
-        # "the last one"
         if 'last' in message_lower:
             return current_dest_ids[-1] if current_dest_ids else None
         
-        # "it", "that", "there"
         if any(word in message_lower for word in ['it', 'that', 'there']):
-            # Return last discussed destination
+            context_data = self.context.context_data or {}
             mentioned = context_data.get('mentioned_entities', {})
             return mentioned.get('last_discussed_destination')
         
         return None
     
     def update_mentioned_destination(self, destination_id: str, destination_name: str):
-        """Track which destination was just discussed"""
-        context_data = self.context.context_data or {}
-        
-        if 'mentioned_entities' not in context_data:
-            context_data['mentioned_entities'] = {}
-        
-        mentioned = context_data['mentioned_entities']
-        
-        # Add to list
-        if 'destinations' not in mentioned:
-            mentioned['destinations'] = []
-        
-        if destination_name not in mentioned['destinations']:
-            mentioned['destinations'].append(destination_name)
-        
-        # Set as last discussed
-        mentioned['last_discussed_destination'] = destination_id
-        mentioned['last_discussed_name'] = destination_name
-        
-        # Update references
-        mentioned['references'] = {
-            'it': destination_id,
-            'that': destination_id,
-            'there': destination_id
-        }
-        
-        self.context.context_data = context_data
-        self.context.save()
+        """
+        Track which destination was just discussed
+        This is now just a wrapper for update_location_context
+        """
+        self.update_location_context(destination_id, destination_name, 'discussed')
     
     def clear_context(self, keep_preferences: bool = True):
         """Clear context for topic change"""
         context_data = self.context.context_data or {}
         
-        # Save topic to history
         current_topic = context_data.get('conversation_flow', {}).get('current_topic')
         if current_topic:
             if 'conversation_flow' not in context_data:
@@ -361,7 +425,6 @@ class ConversationContextManager:
             flow['topic_switches'] = flow.get('topic_switches', 0) + 1
             flow['last_topic_change'] = datetime.now().isoformat()
         
-        # Clear active search
         context_data['active_search'] = {
             'initial_query': None,
             'constraints_applied': [],
@@ -372,14 +435,15 @@ class ConversationContextManager:
             'search_mode': 'fresh'
         }
         
-        # Clear mentioned entities
         context_data['mentioned_entities'] = {
             'destinations': [],
             'last_discussed_destination': None,
             'references': {}
         }
         
-        # Keep or clear preferences
+        # DON'T clear location memory - keep it for ongoing conversation
+        # Only clear if explicitly requested
+        
         if not keep_preferences:
             context_data['user_preferences_learned'] = {}
         
@@ -426,14 +490,13 @@ class ConversationContextManager:
         
         rankings = context_data['rankings_applied']
         
-        # Boost priority based on what user asked about
         if constraint_type == 'budget':
-            rankings['budget_priority'] = 0.30  # Increase from 0.10
-            rankings['weather_priority'] = 0.25  # Decrease others
+            rankings['budget_priority'] = 0.30
+            rankings['weather_priority'] = 0.25
         elif constraint_type == 'safety':
-            rankings['safety_priority'] = 0.35  # Increase
+            rankings['safety_priority'] = 0.35
         elif constraint_type == 'weather':
-            rankings['weather_priority'] = 0.45  # Increase
+            rankings['weather_priority'] = 0.45
         
         self.context.context_data = context_data
         self.context.save()
@@ -448,5 +511,7 @@ class ConversationContextManager:
             'current_destinations': self.get_current_destinations(),
             'constraints_applied': context_data.get('active_search', {}).get('constraints_applied', []),
             'learned_preferences': context_data.get('user_preferences_learned', {}),
-            'ranking_priorities': context_data.get('rankings_applied', {})
+            'ranking_priorities': context_data.get('rankings_applied', {}),
+            'last_discussed_location': self.get_last_discussed_location(),  # NEW
+            'location_history': self.get_location_history()  # NEW
         }
